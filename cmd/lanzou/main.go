@@ -6,7 +6,7 @@ import (
 	"os"
 
 	"github.com/spf13/pflag"
-	"github.com/wantu/lanzou"
+	"github.com/WangTianYou537/gLanz"
 )
 
 func main() {

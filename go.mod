@@ -1,4 +1,4 @@
-module github.com/wantu/lanzou
+module github.com/WangTianYou537/gLanz
 
 go 1.22
 
