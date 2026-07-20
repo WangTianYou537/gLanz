@@ -61,6 +61,7 @@ Usage:
   lanzou <share-url> [flags]              # parse share (legacy)
   lanzou parse <share-url> [flags]
   lanzou login --user U --pass P [--cookie FILE]
+  lanzou login --cookie-str "PHPSESSID=...; ylogin=..."
   lanzou logout [--cookie FILE]
   lanzou list [--folder ID] [--cookie FILE]
   lanzou upload <file> [--folder ID] [--cookie FILE]
@@ -170,15 +171,29 @@ func openAccount(user, pass, cookie string, needLogin bool) *lanzou.Account {
 func runLogin(args []string) {
 	fs := pflag.NewFlagSet("login", pflag.ExitOnError)
 	user, pass, cookie := accountFlags(fs)
+	cookieStr := fs.String("cookie-str", "", "paste browser cookie string (PHPSESSID=...; ylogin=...)")
 	_ = fs.Parse(args)
+	if *cookieStr != "" {
+		acc := lanzou.NewAccount("", "", lanzou.WithCookieFile(*cookie))
+		acc.SetCookie(*cookieStr)
+		if !acc.Verification() {
+			fmt.Fprintln(os.Stderr, "[error] cookie invalid or expired (verification failed)")
+			os.Exit(1)
+		}
+		fmt.Println("[ok] cookie imported and verified, saved to", *cookie)
+		return
+	}
 	if *user == "" || *pass == "" {
 		fmt.Fprintln(os.Stderr, "usage: lanzou login --user U --pass P [--cookie FILE]")
+		fmt.Fprintln(os.Stderr, "   or: lanzou login --cookie-str 'PHPSESSID=...; ylogin=...'")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	acc := lanzou.NewAccount(*user, *pass, lanzou.WithCookieFile(*cookie))
 	if err := acc.Login(); err != nil {
 		fmt.Fprintln(os.Stderr, "[error]", err)
+		fmt.Fprintln(os.Stderr, "tip: if captcha is required, login in browser then:")
+		fmt.Fprintln(os.Stderr, "  lanzou login --cookie-str 'PHPSESSID=...; ylogin=...'")
 		os.Exit(1)
 	}
 	fmt.Println("[ok] logged in, cookie saved to", *cookie)

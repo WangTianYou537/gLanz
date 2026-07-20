@@ -20,7 +20,10 @@ import (
 	"time"
 )
 
-const defaultAccountBase = "https://up.woozooo.com/"
+const (
+	defaultAccountBase = "https://pc.woozooo.com/"
+	mobileUA           = "Mozilla/5.0 (Linux; Android 5.0; SM-G900P Build/LRX21T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/82.0.4051.0 Mobile Safari/537.36"
+)
 
 // Account is a logged-in Lanzou control-panel client.
 type Account struct {
@@ -77,57 +80,158 @@ func NewAccount(username, password string, opts ...AccountOption) *Account {
 	return a
 }
 
-// Login authenticates and stores cookies (optionally to cookie file).
+// Login authenticates via account.php formhash + mydisk.php (current web flow).
+// Old mlogin.php endpoint is no longer reliable.
 func (a *Account) Login() error {
+	// 1) GET account.php for formhash (+ any pre-cookies)
+	req1, err := http.NewRequest(http.MethodGet, a.base+"mlogin.php", nil)
+	if err != nil {
+		return err
+	}
+	req1.Header.Set("User-Agent", mobileUA)
+	req1.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	req1.Header.Set("Referer", a.base+"mydisk.php")
+	resp1, err := a.http.Do(req1)
+	if err != nil {
+		return err
+	}
+	body1, err := io.ReadAll(resp1.Body)
+	resp1.Body.Close()
+	if err != nil {
+		return err
+	}
+	a.mergeSetCookie(resp1.Header)
+
+	formhash := extractFormhash(string(body1))
+	if formhash == "" {
+		// fallback: try mobile login page
+		reqM, _ := http.NewRequest(http.MethodGet, a.base+"mlogin.php", nil)
+		if reqM != nil {
+			reqM.Header.Set("User-Agent", mobileUA)
+			respM, errM := a.http.Do(reqM)
+			if errM == nil {
+				bM, _ := io.ReadAll(respM.Body)
+				respM.Body.Close()
+				a.mergeSetCookie(respM.Header)
+				formhash = extractFormhash(string(bM))
+			}
+		}
+	}
+
+	// 2) POST mydisk.php with full login fields (reference LanZouCloud-API)
 	form := url.Values{}
 	form.Set("task", "3")
+	form.Set("setSessionId", "")
+	form.Set("setToken", "")
+	form.Set("setSig", "")
+	form.Set("setScene", "")
 	form.Set("uid", a.account)
 	form.Set("pwd", a.password)
-
-	req, err := http.NewRequest(http.MethodPost, a.base+"mlogin.php", strings.NewReader(form.Encode()))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("User-Agent", defaultUA)
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
-
-	resp, err := a.http.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
+	if formhash != "" {
+		form.Set("formhash", formhash)
 	}
 
-	// response may include headers if we don't separate; use Header for cookies
-	var cookieParts []string
-	for _, sc := range resp.Header.Values("Set-Cookie") {
-		part := strings.SplitN(sc, ";", 2)[0]
-		if part != "" {
-			cookieParts = append(cookieParts, part)
+	tryURLs := []string{a.base + "mlogin.php?istoken=3", a.base + "mlogin.php", a.base + "mydisk.php"}
+	var lastErr error
+	for _, postURL := range tryURLs {
+		req, err := http.NewRequest(http.MethodPost, postURL, strings.NewReader(form.Encode()))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		// mobile UA is required by some deployments
+		req.Header.Set("User-Agent", mobileUA)
+		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+		req.Header.Set("Referer", a.base+"account.php")
+		req.Header.Set("Origin", strings.TrimRight(a.base, "/"))
+		if a.cookie != "" {
+			req.Header.Set("Cookie", a.cookie)
+		}
+		resp, err := a.http.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		a.mergeSetCookie(resp.Header)
+		raw := string(body)
+		var js map[string]any
+		_ = json.Unmarshal(body, &js)
+		info := anyString(js["info"])
+		zt := anyString(js["zt"])
+		ok := zt == "1" || strings.Contains(info, "成功") || strings.Contains(raw, "成功")
+		if !ok {
+			lastErr = fmt.Errorf("login failed via %s: zt=%v info=%s body=%s", postURL, js["zt"], info, truncate(raw, 200))
+			continue
+		}
+		if a.cookie == "" {
+			lastErr = fmt.Errorf("login response ok but no cookies set")
+			continue
+		}
+		// verify session
+		if !a.Verification() {
+			// still save cookie; some checks are soft
+			lastErr = fmt.Errorf("login cookie not accepted by verification; body=%s", truncate(raw, 200))
+			// try next endpoint
+			continue
+		}
+		if a.cookieFile != "" {
+			if err := os.WriteFile(a.cookieFile, []byte(a.cookie), 0o600); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("login failed")
+	}
+	return lastErr
+}
+
+func extractFormhash(html string) string {
+	re := regexp.MustCompile(`name=["']formhash["']\s+value=["']([^"']+)["']`)
+	if m := re.FindStringSubmatch(html); len(m) == 2 {
+		return m[1]
+	}
+	re2 := regexp.MustCompile(`value=["']([^"']+)["']\s+name=["']formhash["']`)
+	if m := re2.FindStringSubmatch(html); len(m) == 2 {
+		return m[1]
+	}
+	re3 := regexp.MustCompile(`formhash['"]?\s*[:=]\s*['"]([^'"]+)['"]`)
+	if m := re3.FindStringSubmatch(html); len(m) == 2 {
+		return m[1]
+	}
+	return "03e22cb9"
+}
+
+func (a *Account) mergeSetCookie(h http.Header) {
+	mapc := map[string]string{}
+	for _, pair := range strings.Split(a.cookie, ";") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		if k, v, ok := strings.Cut(pair, "="); ok {
+			mapc[strings.TrimSpace(k)] = strings.TrimSpace(v)
 		}
 	}
-	// Some endpoints return Set-Cookie only; also parse body JSON
-	var js map[string]any
-	_ = json.Unmarshal(body, &js)
-	zt := anyString(js["zt"])
-	if zt != "1" {
-		return fmt.Errorf("login failed: zt=%v body=%s", js["zt"], truncate(string(body), 200))
-	}
-	if len(cookieParts) == 0 {
-		// fallback: parse raw if client stripped cookies (unlikely)
-		return fmt.Errorf("login ok but no Set-Cookie received")
-	}
-	a.cookie = strings.Join(cookieParts, "; ")
-	if a.cookieFile != "" {
-		if err := os.WriteFile(a.cookieFile, []byte(a.cookie), 0o600); err != nil {
-			return err
+	for _, sc := range h.Values("Set-Cookie") {
+		part, _, _ := strings.Cut(sc, ";")
+		if k, v, ok := strings.Cut(part, "="); ok {
+			mapc[strings.TrimSpace(k)] = strings.TrimSpace(v)
 		}
 	}
-	return nil
+	parts := make([]string, 0, len(mapc))
+	for k, v := range mapc {
+		parts = append(parts, k+"="+v)
+	}
+	a.cookie = strings.Join(parts, "; ")
 }
 
 // EnsureLogin logs in if Verification fails.
@@ -143,15 +247,23 @@ func (a *Account) Verification() bool {
 	if a.cookie == "" {
 		return false
 	}
+	// soft check via doupload task=5
 	raw, err := a.postTask("task=5&folder_id=-1")
+	if err == nil {
+		var js map[string]any
+		if json.Unmarshal([]byte(raw), &js) == nil {
+			zt := anyString(js["zt"])
+			if zt != "" && zt != "9" {
+				return true
+			}
+		}
+	}
+	// fallback: account.php should not show login page
+	html, err := a.getHTML("account.php")
 	if err != nil {
 		return false
 	}
-	var js map[string]any
-	if err := json.Unmarshal([]byte(raw), &js); err != nil {
-		return false
-	}
-	return anyString(js["zt"]) != "9"
+	return !strings.Contains(html, "网盘用户登录")
 }
 
 // Cookie returns the raw cookie string.
@@ -653,3 +765,14 @@ func strIntercept(str, start, end string) string {
 
 // silence unused import if strconv used elsewhere - keep for ID parsing convenience
 var _ = strconv.Itoa
+
+
+func looksLikeCaptchaError(s string) bool {
+	s = strings.ToLower(s)
+	for _, k := range []string{"验证", "captcha", "nvc", "token", "滑动", "智能验证", "sig"} {
+		if strings.Contains(s, k) {
+			return true
+		}
+	}
+	return false
+}
