@@ -22,7 +22,6 @@ import (
 
 const (
 	defaultAccountBase = "https://pc.woozooo.com/"
-	mobileUA           = "Mozilla/5.0 (Linux; Android 5.0; SM-G900P Build/LRX21T) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/82.0.4051.0 Mobile Safari/537.36"
 )
 
 // Account is a logged-in Lanzou control-panel client.
@@ -80,145 +79,54 @@ func NewAccount(username, password string, opts ...AccountOption) *Account {
 	return a
 }
 
-// Login authenticates via account.php formhash + mydisk.php (current web flow).
-// Old mlogin.php endpoint is no longer reliable.
+// Login POSTs task/uid/pwd to mlogin.php (same as browser/curl simple login).
 func (a *Account) Login() error {
-	// 1) GET account.php for formhash (+ any pre-cookies)
-	req1, err := http.NewRequest(http.MethodGet, a.base+"mlogin.php", nil)
-	if err != nil {
-		return err
-	}
-	req1.Header.Set("User-Agent", mobileUA)
-	req1.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
-	req1.Header.Set("Referer", a.base+"mydisk.php")
-	resp1, err := a.http.Do(req1)
-	if err != nil {
-		return err
-	}
-	body1, err := io.ReadAll(resp1.Body)
-	resp1.Body.Close()
-	if err != nil {
-		return err
-	}
-	a.mergeSetCookie(resp1.Header)
-
-	formhash := extractFormhash(string(body1))
-	if formhash == "" {
-		// fallback: try mobile login page
-		reqM, _ := http.NewRequest(http.MethodGet, a.base+"mlogin.php", nil)
-		if reqM != nil {
-			reqM.Header.Set("User-Agent", mobileUA)
-			respM, errM := a.http.Do(reqM)
-			if errM == nil {
-				bM, _ := io.ReadAll(respM.Body)
-				respM.Body.Close()
-				a.mergeSetCookie(respM.Header)
-				formhash = extractFormhash(string(bM))
-			}
-		}
-	}
-
-	// 2) POST mydisk.php with full login fields (reference LanZouCloud-API)
 	form := url.Values{}
 	form.Set("task", "3")
-	form.Set("setSessionId", "")
-	form.Set("setToken", "")
-	form.Set("setSig", "")
-	form.Set("setScene", "")
 	form.Set("uid", a.account)
 	form.Set("pwd", a.password)
-	if formhash != "" {
-		form.Set("formhash", formhash)
-	}
 
-	tryURLs := []string{a.base + "mlogin.php?istoken=3", a.base + "mlogin.php", a.base + "mydisk.php"}
-	var lastErr error
-	for _, postURL := range tryURLs {
-		req, err := http.NewRequest(http.MethodPost, postURL, strings.NewReader(form.Encode()))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		// mobile UA is required by some deployments
-		req.Header.Set("User-Agent", mobileUA)
-		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
-		req.Header.Set("Referer", a.base+"account.php")
-		req.Header.Set("Origin", strings.TrimRight(a.base, "/"))
-		if a.cookie != "" {
-			req.Header.Set("Cookie", a.cookie)
-		}
-		resp, err := a.http.Do(req)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		a.mergeSetCookie(resp.Header)
-		raw := string(body)
-		var js map[string]any
-		_ = json.Unmarshal(body, &js)
+	req, err := http.NewRequest(http.MethodPost, a.base+"mlogin.php", strings.NewReader(form.Encode()))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", defaultUA)
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+	req.Header.Set("Referer", a.base+"mlogin.php")
+	req.Header.Set("Origin", strings.TrimRight(a.base, "/"))
+
+	resp, err := a.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+	a.mergeSetCookie(resp.Header)
+
+	var js map[string]any
+	if err := json.Unmarshal(body, &js); err != nil {
+		return fmt.Errorf("login non-json: %w body=%s", err, truncate(string(body), 200))
+	}
+	if anyString(js["zt"]) != "1" {
 		info := anyString(js["info"])
-		zt := anyString(js["zt"])
-		ok := zt == "1" || strings.Contains(info, "成功") || strings.Contains(raw, "成功")
-			if !ok {
-				// mlogin JSON auth error is definitive
-				if info != "" || strings.Contains(raw, `"zt"`) {
-					if looksLikeCaptchaError(info) || looksLikeCaptchaError(raw) {
-						return fmt.Errorf("login requires captcha (阿里云智能验证). Browser login then: lanzou login --cookie-str 'PHPSESSID=...; ylogin=...' (server: %s)", info)
-					}
-					msg := info
-					if msg == "" {
-						msg = truncate(raw, 200)
-					}
-					return fmt.Errorf("login failed: %s", msg)
-				}
-				lastErr = fmt.Errorf("login failed via %s: body=%s", postURL, truncate(raw, 200))
-				continue
-			}
-			if a.cookie == "" {
-			lastErr = fmt.Errorf("login response ok but no cookies set")
-			continue
+		if info == "" {
+			info = truncate(string(body), 200)
 		}
-		// verify session
-		if !a.Verification() {
-			// still save cookie; some checks are soft
-			lastErr = fmt.Errorf("login cookie not accepted by verification; body=%s", truncate(raw, 200))
-			// try next endpoint
-			continue
+		return fmt.Errorf("login failed: %s", info)
+	}
+	if a.cookie == "" {
+		return fmt.Errorf("login ok but no Set-Cookie received")
+	}
+	if a.cookieFile != "" {
+		if err := os.WriteFile(a.cookieFile, []byte(a.cookie), 0o600); err != nil {
+			return err
 		}
-		if a.cookieFile != "" {
-			if err := os.WriteFile(a.cookieFile, []byte(a.cookie), 0o600); err != nil {
-				return err
-			}
-		}
-		return nil
 	}
-	if lastErr == nil {
-		lastErr = fmt.Errorf("login failed")
-	}
-	return lastErr
-}
-
-func extractFormhash(html string) string {
-	re := regexp.MustCompile(`name=["']formhash["']\s+value=["']([^"']+)["']`)
-	if m := re.FindStringSubmatch(html); len(m) == 2 {
-		return m[1]
-	}
-	re2 := regexp.MustCompile(`value=["']([^"']+)["']\s+name=["']formhash["']`)
-	if m := re2.FindStringSubmatch(html); len(m) == 2 {
-		return m[1]
-	}
-	re3 := regexp.MustCompile(`formhash['"]?\s*[:=]\s*['"]([^'"]+)['"]`)
-	if m := re3.FindStringSubmatch(html); len(m) == 2 {
-		return m[1]
-	}
-	return "03e22cb9"
+	return nil
 }
 
 func (a *Account) mergeSetCookie(h http.Header) {
@@ -244,6 +152,7 @@ func (a *Account) mergeSetCookie(h http.Header) {
 	}
 	a.cookie = strings.Join(parts, "; ")
 }
+
 
 // EnsureLogin logs in if Verification fails.
 func (a *Account) EnsureLogin() error {
@@ -357,46 +266,40 @@ type ListEntry struct {
 }
 
 // List returns folders + files under folderID ("-1" is root).
+// Folders via task=47, files via task=5 (JSON APIs).
 func (a *Account) List(folderID string) ([]ListEntry, error) {
 	if folderID == "" {
 		folderID = "-1"
 	}
-	html, err := a.getHTML("myfile.php?folder_id=" + url.QueryEscape(folderID))
+	var out []ListEntry
+
+	// folders
+	rawDir, err := a.postTask("task=47&folder_id=" + url.QueryEscape(folderID))
 	if err != nil {
 		return nil, err
 	}
-	var out []ListEntry
-	// folders between markers
-	section := strIntercept(html, "<!--folder list index-->", "<!--file list index-->")
-	marker := `<div class="folder">
-	<div class="folders">
-		<div class="folm" onclick="modify(`
-	if section == "" {
-		// tolerate whitespace variants
-		reFolder := regexp.MustCompile(`onclick="modify\((\d+)\)"[\s\S]*?<span>([^<]*)</span>[\s\S]*?<a href="([^"]*)"[\s\S]*?<div class="folders1">([^<]*)</div>`)
-		for _, m := range reFolder.FindAllStringSubmatch(html, -1) {
-			out = append(out, ListEntry{
-				Type: EntryFolder, ID: m[1], Name: m[2], URL: m[3], Description: strings.TrimSpace(m[4]),
-			})
+	var dirJS struct {
+		ZT   any `json:"zt"`
+		Text []struct {
+			Name      string `json:"name"`
+			FolID     any    `json:"fol_id"`
+			FolderDes string `json:"folder_des"`
+		} `json:"text"`
+	}
+	if err := json.Unmarshal([]byte(rawDir), &dirJS); err != nil {
+		return nil, fmt.Errorf("list folders json: %w body=%s", err, truncate(rawDir, 200))
+	}
+	for _, it := range dirJS.Text {
+		id := anyString(it.FolID)
+		if id == "" {
+			continue
 		}
-	} else {
-		parts := strings.Split(section, marker)
-		for _, item := range parts {
-			item = strings.TrimSpace(item)
-			if item == "" {
-				continue
-			}
-			id := strIntercept(item, "", ")")
-			name := strIntercept(item, "<span>", "</span>")
-			u := strIntercept(item, `<a href="`, `"`)
-			desc := strIntercept(item, `<div class="folders1">`, `</div>`)
-			if id == "" && name == "" {
-				continue
-			}
-			out = append(out, ListEntry{Type: EntryFolder, ID: id, Name: name, URL: u, Description: desc})
-		}
+		out = append(out, ListEntry{
+			Type: EntryFolder, ID: id, Name: it.Name, Description: it.FolderDes,
+		})
 	}
 
+	// files
 	raw, err := a.postTask("task=5&folder_id=" + url.QueryEscape(folderID))
 	if err != nil {
 		return out, err
@@ -415,9 +318,8 @@ func (a *Account) List(folderID string) ([]ListEntry, error) {
 	}
 	for _, it := range js.Text {
 		id := anyString(it.ID)
-		desc, _ := a.GetFileDescribe(id)
 		out = append(out, ListEntry{
-			Type: EntryFile, ID: id, Name: it.NameAll, Size: it.Size, Time: it.Time, Description: desc,
+			Type: EntryFile, ID: id, Name: it.NameAll, Size: it.Size, Time: it.Time,
 		})
 	}
 	return out, nil
@@ -778,12 +680,3 @@ func strIntercept(str, start, end string) string {
 var _ = strconv.Itoa
 
 
-func looksLikeCaptchaError(s string) bool {
-	s = strings.ToLower(s)
-	for _, k := range []string{"验证", "captcha", "nvc", "token", "滑动", "智能验证", "sig"} {
-		if strings.Contains(s, k) {
-			return true
-		}
-	}
-	return false
-}
