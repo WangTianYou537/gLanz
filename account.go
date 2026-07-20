@@ -166,11 +166,22 @@ func (a *Account) Login() error {
 		info := anyString(js["info"])
 		zt := anyString(js["zt"])
 		ok := zt == "1" || strings.Contains(info, "成功") || strings.Contains(raw, "成功")
-		if !ok {
-			lastErr = fmt.Errorf("login failed via %s: zt=%v info=%s body=%s", postURL, js["zt"], info, truncate(raw, 200))
-			continue
-		}
-		if a.cookie == "" {
+			if !ok {
+				// mlogin JSON auth error is definitive
+				if info != "" || strings.Contains(raw, `"zt"`) {
+					if looksLikeCaptchaError(info) || looksLikeCaptchaError(raw) {
+						return fmt.Errorf("login requires captcha (阿里云智能验证). Browser login then: lanzou login --cookie-str 'PHPSESSID=...; ylogin=...' (server: %s)", info)
+					}
+					msg := info
+					if msg == "" {
+						msg = truncate(raw, 200)
+					}
+					return fmt.Errorf("login failed: %s", msg)
+				}
+				lastErr = fmt.Errorf("login failed via %s: body=%s", postURL, truncate(raw, 200))
+				continue
+			}
+			if a.cookie == "" {
 			lastErr = fmt.Errorf("login response ok but no cookies set")
 			continue
 		}
