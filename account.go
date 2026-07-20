@@ -5,12 +5,15 @@
 package lanzou
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -490,10 +493,134 @@ func (a *Account) DeleteFile(fileID string) (string, error) {
 	return a.postTask("task=6&file_id=" + url.QueryEscape(fileID))
 }
 
-// Upload is not implemented in the original PHP class (no multipart endpoint there).
-// Kept as a clear stub so callers know the gap.
-func (a *Account) Upload(localPath, folderID string) error {
-	return fmt.Errorf("upload not implemented: original PHP class has no upload API; use web doupload flow separately")
+// UploadResult is the outcome of a successful Upload.
+type UploadResult struct {
+	FileID   string
+	Name     string
+	RawJSON  string
+	FolderID string
+}
+
+// Upload uploads a local file to folderID ("-1" = root) via fileup.php.
+// Protocol mirrors common Lanzou web clients (task=1 multipart to fileup.php).
+// See: https://github.com/zaxtyson/LanZouCloud-API
+func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
+	if folderID == "" {
+		folderID = "-1"
+	}
+	f, err := os.Open(localPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if st.IsDir() {
+		return nil, fmt.Errorf("path is a directory: %s", localPath)
+	}
+	filename := filepath.Base(localPath)
+
+	var body bytes.Buffer
+	w := multipart.NewWriter(&body)
+	_ = w.WriteField("task", "1")
+	_ = w.WriteField("vie", "2")
+	_ = w.WriteField("ve", "2")
+	_ = w.WriteField("id", "WU_FILE_0")
+	_ = w.WriteField("folder_id_bb_n", folderID)
+	_ = w.WriteField("name", filename)
+	part, err := w.CreateFormFile("upload_file", filename)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := io.Copy(part, f); err != nil {
+		return nil, err
+	}
+	ct := w.FormDataContentType()
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
+	payload := body.Bytes()
+
+	tryURLs := []string{a.base + "fileup.php"}
+	// also try pc.woozooo.com host (common web endpoint)
+	if u, err := url.Parse(a.base); err == nil {
+		host := u.Host
+		if host == "up.woozooo.com" {
+			tryURLs = append(tryURLs, "https://pc.woozooo.com/fileup.php")
+		} else if host == "pc.woozooo.com" {
+			tryURLs = append(tryURLs, "https://up.woozooo.com/fileup.php")
+		}
+	}
+
+	client := *a.http
+	client.Timeout = 60 * time.Minute
+
+	var lastErr error
+	var raw string
+	for _, upURL := range tryURLs {
+		req, err := http.NewRequest(http.MethodPost, upURL, bytes.NewReader(payload))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		req.Header.Set("Content-Type", ct)
+		req.Header.Set("User-Agent", defaultUA)
+		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
+		req.Header.Set("Referer", a.base)
+		req.Header.Set("Origin", strings.TrimRight(a.base, "/"))
+		if a.cookie != "" {
+			req.Header.Set("Cookie", a.cookie)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		rawB, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		raw = string(rawB)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("upload status %s body=%s", resp.Status, truncate(raw, 300))
+			continue
+		}
+		var js map[string]any
+		if err := json.Unmarshal(rawB, &js); err != nil {
+			lastErr = fmt.Errorf("upload non-json: %w body=%s", err, truncate(raw, 300))
+			continue
+		}
+		if anyString(js["zt"]) != "1" {
+			lastErr = fmt.Errorf("upload failed: %s", truncate(raw, 300))
+			continue
+		}
+		fileID := ""
+		name := filename
+		if text, ok := js["text"].([]any); ok && len(text) > 0 {
+			if row, ok := text[0].(map[string]any); ok {
+				fileID = anyString(row["id"])
+				if n := anyString(row["name"]); n != "" {
+					name = n
+				} else if n := anyString(row["name_all"]); n != "" {
+					name = n
+				}
+			}
+		}
+		return &UploadResult{
+			FileID:   fileID,
+			Name:     name,
+			RawJSON:  raw,
+			FolderID: folderID,
+		}, nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("upload failed")
+	}
+	return nil, lastErr
 }
 
 // --- string helpers (PHP strIntercept port) ---
