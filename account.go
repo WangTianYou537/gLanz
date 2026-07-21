@@ -565,11 +565,7 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 	}
 	payload := body.Bytes()
 
-	// Prefer html5up.php (current browser endpoint); keep fileup.php as fallback.
-	tryURLs := []string{
-		a.base + "html5up.php",
-		a.base + "fileup.php",
-	}
+	tryURLs := []string{a.base + "html5up.php"}
 	if u, err := url.Parse(a.base); err == nil {
 		alt := "https://pc.woozooo.com/"
 		if u.Host == "pc.woozooo.com" {
@@ -578,7 +574,7 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 			alt = "https://pc.woozooo.com/"
 		}
 		if alt != a.base {
-			tryURLs = append(tryURLs, alt+"html5up.php", alt+"fileup.php")
+			tryURLs = append(tryURLs, alt+"html5up.php")
 		}
 	}
 
