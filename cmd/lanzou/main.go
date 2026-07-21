@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/WangTianYou537/gLanz"
 	"github.com/spf13/pflag"
@@ -896,86 +897,63 @@ func downloadSplitGroup(acc *lanzou.Account, r resolvedDownload, outDir string, 
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return err
 	}
-	// download each part to temp files, then concat
 	type partFile struct {
 		index int
 		path  string
 	}
-	var (
-		mu    sync.Mutex
-		files []partFile
-		fail  atomic.Int32
-		done  atomic.Int32
-	)
-	total := len(r.Parts)
-	fmt.Printf("[download] split %s  parts=%d  jobs=%d\n", r.OrigName, total, jobs)
+	var files []partFile
+	// Sort by index for stable merge
+	parts := append([]resolvedPart(nil), r.Parts...)
+	sort.SliceStable(parts, func(i, j int) bool { return parts[i].Index < parts[j].Index })
+	total := len(parts)
+	// Force serial for large multi-part sets; jobs only kept for API compatibility.
+	_ = jobs
+	fmt.Printf("[download] split %s  parts=%d  (serial)\n", r.OrigName, total)
 
-	ch := make(chan resolvedPart)
-	var wg sync.WaitGroup
-	worker := func() {
-		defer wg.Done()
-		for p := range ch {
-			tmp, err := os.CreateTemp(outDir, fmt.Sprintf("part-%03d-*.bin", p.Index))
-			if err != nil {
-				fail.Add(1)
-				fmt.Fprintf(os.Stderr, "[fail] part %d: %v\n", p.Index, err)
-				continue
+	for i, p := range parts {
+		n := i + 1
+		tmp, err := os.CreateTemp(outDir, fmt.Sprintf("part-%03d-*.bin", p.Index))
+		if err != nil {
+			return err
+		}
+		tmpPath := tmp.Name()
+		tmp.Close()
+		share, pwd, err := acc.GetFileDownloadInfo(p.FileID)
+		if err != nil {
+			os.Remove(tmpPath)
+			// cleanup prior
+			for _, f := range files {
+				os.Remove(f.path)
 			}
-			tmpPath := tmp.Name()
-			tmp.Close()
-			// download with remote name first into outDir, then move — simpler: use downloadShare with basename of tmp
-			share, pwd, err := acc.GetFileDownloadInfo(p.FileID)
-			if err != nil {
-				os.Remove(tmpPath)
-				fail.Add(1)
-				fmt.Fprintf(os.Stderr, "[fail] part %d info: %v\n", p.Index, err)
-				continue
+			return fmt.Errorf("part %d info: %w", p.Index, err)
+		}
+		partName := fmt.Sprintf(".%s.part%03d.download", sanitizeName(r.OrigName), p.Index)
+		fmt.Printf("[download] part %d/%d id=%s\n", n, total, p.FileID)
+		err = downloadShare(share, pwd, outDir, partName)
+		if err != nil {
+			os.Remove(tmpPath)
+			os.Remove(filepath.Join(outDir, partName))
+			for _, f := range files {
+				os.Remove(f.path)
 			}
-			// downloadShare writes filename into outDir; use unique name then rename
-			partName := fmt.Sprintf(".%s.part%03d.download", sanitizeName(r.OrigName), p.Index)
-			err = downloadShare(share, pwd, outDir, partName)
-			n := done.Add(1)
-			if err != nil {
-				os.Remove(tmpPath)
-				os.Remove(filepath.Join(outDir, partName))
-				fail.Add(1)
-				fmt.Fprintf(os.Stderr, "[fail %d/%d] part %d: %v\n", n, total, p.Index, err)
-				continue
-			}
-			downloaded := filepath.Join(outDir, partName)
-			// If suffix_mode=zip, the downloaded file is a zip containing the raw chunk.
-			rawPath, cleanup, err := extractPartPayload(downloaded, tmpPath)
-			if err != nil {
-				os.Remove(downloaded)
-				fail.Add(1)
-				fmt.Fprintf(os.Stderr, "[fail %d/%d] part %d extract: %v\n", n, total, p.Index, err)
-				continue
-			}
-			_ = cleanup
+			return fmt.Errorf("part %d/%d: %w", n, total, err)
+		}
+		downloaded := filepath.Join(outDir, partName)
+		rawPath, _, err := extractPartPayload(downloaded, tmpPath)
+		if err != nil {
 			os.Remove(downloaded)
-			mu.Lock()
-			files = append(files, partFile{index: p.Index, path: rawPath})
-			mu.Unlock()
-			fmt.Printf("[ok %d/%d] part %d\n", n, total, p.Index)
+			for _, f := range files {
+				os.Remove(f.path)
+			}
+			return fmt.Errorf("part %d extract: %w", p.Index, err)
 		}
-	}
-	if jobs < 1 {
-		jobs = 3
-	}
-	wg.Add(jobs)
-	for i := 0; i < jobs; i++ {
-		go worker()
-	}
-	for _, p := range r.Parts {
-		ch <- p
-	}
-	close(ch)
-	wg.Wait()
-	if fail.Load() > 0 {
-		for _, f := range files {
-			os.Remove(f.path)
+		os.Remove(downloaded)
+		files = append(files, partFile{index: p.Index, path: rawPath})
+		fmt.Printf("[ok %d/%d] part %d\n", n, total, p.Index)
+		// brief pause between large CDN fetches
+		if i+1 < total {
+			time.Sleep(500 * time.Millisecond)
 		}
-		return fmt.Errorf("%d/%d split parts failed", fail.Load(), total)
 	}
 	sort.Slice(files, func(i, j int) bool { return files[i].index < files[j].index })
 	outPath := filepath.Join(outDir, sanitizeName(r.OrigName))
@@ -1004,64 +982,6 @@ func downloadSplitGroup(acc *lanzou.Account, r resolvedDownload, outDir string, 
 	return nil
 }
 
-// extractPartPayload returns raw part bytes path.
-// If downloaded is a zip with a single entry (suffix_mode=zip), extract it;
-// otherwise treat the file itself as the raw payload (rename mode).
-func extractPartPayload(downloaded, preferPath string) (rawPath string, cleanup func(), err error) {
-	cleanup = func() {}
-	// try zip
-	zr, err := zip.OpenReader(downloaded)
-	if err == nil {
-		defer zr.Close()
-		if len(zr.File) >= 1 {
-			// use first entry
-			rc, err := zr.File[0].Open()
-			if err != nil {
-				return "", cleanup, err
-			}
-			defer rc.Close()
-			out, err := os.Create(preferPath)
-			if err != nil {
-				return "", cleanup, err
-			}
-			if _, err := io.Copy(out, rc); err != nil {
-				out.Close()
-				os.Remove(preferPath)
-				return "", cleanup, err
-			}
-			if err := out.Close(); err != nil {
-				os.Remove(preferPath)
-				return "", cleanup, err
-			}
-			cleanup = func() { _ = os.Remove(preferPath) }
-			return preferPath, cleanup, nil
-		}
-	}
-	// not a zip / empty: move/copy downloaded to preferPath
-	if err := os.Rename(downloaded, preferPath); err != nil {
-		// cross-device fallback
-		in, err := os.Open(downloaded)
-		if err != nil {
-			return "", cleanup, err
-		}
-		out, err := os.Create(preferPath)
-		if err != nil {
-			in.Close()
-			return "", cleanup, err
-		}
-		if _, err := io.Copy(out, in); err != nil {
-			in.Close()
-			out.Close()
-			os.Remove(preferPath)
-			return "", cleanup, err
-		}
-		in.Close()
-		out.Close()
-		os.Remove(downloaded)
-	}
-	cleanup = func() { _ = os.Remove(preferPath) }
-	return preferPath, cleanup, nil
-}
 
 func downloadFileByID(acc *lanzou.Account, fileID, name, outDir string) error {
 	share, pwd, err := acc.GetFileDownloadInfo(fileID)
@@ -1071,110 +991,48 @@ func downloadFileByID(acc *lanzou.Account, fileID, name, outDir string) error {
 	if share == "" {
 		return fmt.Errorf("empty share url for file %s", fileID)
 	}
-	// If local name still looks converted, try note for original.
 	saveName := name
 	if desc, err := acc.GetFileDescribe(fileID); err == nil {
 		if cm, ok := lanzou.ParseConvertNote(desc); ok && cm.Name != "" {
 			saveName = cm.Name
 		}
 	}
+	if saveName == "" {
+		saveName = fileID
+	}
 	fmt.Printf("[download] file id=%s name=%s\n", fileID, saveName)
 	if err := downloadShare(share, pwd, outDir, saveName); err != nil {
 		return err
 	}
-	// If uploaded as real zip convert of a non-zip original, extract single entry
-	// only when saveName differs from remote and remote was zip of original.
-	// Keep simple: file already saved as saveName via multipart filename override.
-	// For mode=zip, downloaded content is zip bytes but named saveName — extract if needed.
-	saved := filepath.Join(outDir, saveName)
-	if st, err := os.Stat(saved); err == nil && st.Size() > 0 {
-		if needsUnzipConvert(saved, saveName) {
-			if err := unzipSingleTo(saved, saved+".raw"); err == nil {
-				_ = os.Remove(saved)
-				_ = os.Rename(saved+".raw", saved)
-				fmt.Println("[download] extracted original payload ->", saved)
+	saved := filepath.Join(outDir, filepath.Base(saveName))
+	// If server name differs (DownloadShare may use Content-Disposition), try saveName path first.
+	if _, err := os.Stat(saved); err != nil {
+		// best-effort: leave whatever was saved
+		return nil
+	}
+	if needsUnzipConvert(saved, saveName) {
+		raw := saved + ".raw"
+		if err := unzipSingleTo(saved, raw); err == nil {
+			_ = os.Remove(saved)
+			if err := os.Rename(raw, saved); err != nil {
+				return err
 			}
+			fmt.Printf("[download] extracted original payload -> %s\n", saved)
 		}
 	}
 	return nil
-}
-
-func needsUnzipConvert(path, wantName string) bool {
-	// Heuristic: file is a zip and first entry name equals wantName.
-	zr, err := zip.OpenReader(path)
-	if err != nil {
-		return false
-	}
-	defer zr.Close()
-	if len(zr.File) != 1 {
-		return false
-	}
-	return zr.File[0].Name == wantName || filepath.Base(zr.File[0].Name) == filepath.Base(wantName)
-}
-
-func unzipSingleTo(zipPath, dest string) error {
-	zr, err := zip.OpenReader(zipPath)
-	if err != nil {
-		return err
-	}
-	defer zr.Close()
-	if len(zr.File) < 1 {
-		return fmt.Errorf("empty zip")
-	}
-	rc, err := zr.File[0].Open()
-	if err != nil {
-		return err
-	}
-	defer rc.Close()
-	out, err := os.Create(dest)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, rc)
-	return err
 }
 
 func downloadFolderRecursive(acc *lanzou.Account, folderID, destDir string, jobs int) error {
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return err
 	}
-	// collect all files first
 	var files []dlJob
 	var walk func(fid, dir string) error
 	walk = func(fid, dir string) error {
 		list, err := acc.List(fid)
 		if err != nil {
 			return err
-		}
-		notes := acc.FetchNotes(list)
-		// first expand split groups in this folder so we don't download parts separately
-		seen := map[string]bool{}
-		// handle splits by original name
-		splitResolved := map[string]resolvedDownload{}
-		for _, e := range list {
-			if e.Type != lanzou.EntryFile {
-				continue
-			}
-			note := notes[e.ID]
-			if pm, ok := lanzou.ParsePartNote(note); ok {
-				key := strings.ToLower(pm.Name)
-				if key == "" {
-					key = pm.GroupID
-				}
-				r := splitResolved[key]
-				r.Kind = "split"
-				r.OrigName = pm.Name
-				r.Parts = append(r.Parts, resolvedPart{FileID: e.ID, Name: e.Name, Index: pm.Index, Total: pm.Total, Size: pm.Size})
-				splitResolved[key] = r
-				seen[e.ID] = true
-			}
-		}
-		for _, r := range splitResolved {
-			sort.SliceStable(r.Parts, func(i, j int) bool { return r.Parts[i].Index < r.Parts[j].Index })
-			if err := downloadSplitGroup(acc, r, dir, jobs); err != nil {
-				fmt.Fprintf(os.Stderr, "[warn] split %s: %v\n", r.OrigName, err)
-			}
 		}
 		for _, e := range list {
 			if e.Type == lanzou.EntryFolder {
@@ -1187,21 +1045,12 @@ func downloadFolderRecursive(acc *lanzou.Account, folderID, destDir string, jobs
 				}
 				continue
 			}
-			if seen[e.ID] {
-				continue
-			}
-			saveName := e.Name
-			if note := notes[e.ID]; note != "" {
-				if cm, ok := lanzou.ParseConvertNote(note); ok && cm.Name != "" {
-					saveName = cm.Name
-				}
-			}
 			share, pwd, err := acc.GetFileDownloadInfo(e.ID)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "[warn] skip %s: %v\n", e.Name, err)
 				continue
 			}
-			files = append(files, dlJob{fileID: e.ID, name: saveName, destDir: dir, shareURL: share, pwd: pwd})
+			files = append(files, dlJob{fileID: e.ID, name: e.Name, destDir: dir, shareURL: share, pwd: pwd})
 		}
 		return nil
 	}
@@ -1209,25 +1058,15 @@ func downloadFolderRecursive(acc *lanzou.Account, folderID, destDir string, jobs
 		return err
 	}
 	fmt.Printf("[download] %d files queued\n", len(files))
-	// downloadJobs then post-extract converts
-	if err := downloadJobs(files, jobs); err != nil {
-		return err
-	}
-	for _, j := range files {
-		saved := filepath.Join(j.destDir, j.name)
-		if needsUnzipConvert(saved, j.name) {
-			if err := unzipSingleTo(saved, saved+".raw"); err == nil {
-				_ = os.Remove(saved)
-				_ = os.Rename(saved+".raw", saved)
-			}
-		}
-	}
-	return nil
+	return downloadJobs(files, jobs)
 }
 
 func downloadJobs(jobs []dlJob, concurrency int) error {
 	if len(jobs) == 0 {
 		return nil
+	}
+	if concurrency < 1 {
+		concurrency = 3
 	}
 	ch := make(chan dlJob)
 	var wg sync.WaitGroup
@@ -1263,23 +1102,102 @@ func downloadJobs(jobs []dlJob, concurrency int) error {
 	return nil
 }
 
+// downloadShare resolves a share link and streams the file in one CDN GET when possible.
 func downloadShare(shareURL, pwd, outDir, filename string) error {
 	c := lanzou.New()
-	res, err := c.Parse(shareURL, lanzou.Options{Password: pwd, ResolveDirect: true})
+	_, err := c.DownloadShare(shareURL, pwd, outDir, filename)
+	return err
+}
+
+func needsUnzipConvert(path, wantName string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() < 4 {
+		return false
+	}
+	zr, err := zip.NewReader(f, st.Size())
+	if err != nil || len(zr.File) != 1 {
+		return false
+	}
+	name := zr.File[0].Name
+	base := filepath.Base(name)
+	return name == wantName || base == wantName || filepath.Base(wantName) == base
+}
+
+func unzipSingleTo(zipPath, dest string) error {
+	r, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return err
 	}
-	u := res.Direct
-	if u == "" {
-		u = res.Telecom
+	defer r.Close()
+	if len(r.File) == 0 {
+		return fmt.Errorf("empty zip")
 	}
-	name := filename
-	if name == "" {
-		name = res.Filename
+	rc, err := r.File[0].Open()
+	if err != nil {
+		return err
 	}
-	_, err = c.Download(u, outDir, name, "")
+	defer rc.Close()
+	out, err := os.Create(dest)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, rc)
 	return err
 }
+
+func extractPartPayload(downloaded, prefer string) (string, string, error) {
+	// Prefer unzip first entry when the part is a real zip wrapper.
+	if r, err := zip.OpenReader(downloaded); err == nil {
+		if len(r.File) > 0 {
+			rc, err := r.File[0].Open()
+			if err == nil {
+				out, err2 := os.Create(prefer)
+				if err2 == nil {
+					_, err3 := io.Copy(out, rc)
+					out.Close()
+					rc.Close()
+					r.Close()
+					if err3 == nil {
+						return prefer, r.File[0].Name, nil
+					}
+					os.Remove(prefer)
+				} else {
+					rc.Close()
+				}
+			}
+		}
+		r.Close()
+	}
+	// rename / copy as raw payload
+	if err := os.Rename(downloaded, prefer); err != nil {
+		if _, err2 := copyFile(downloaded, prefer); err2 != nil {
+			return "", "", err2
+		}
+		os.Remove(downloaded)
+	}
+	return prefer, "", nil
+}
+
+func copyFile(src, dst string) (int64, error) {
+	in, err := os.Open(src)
+	if err != nil {
+		return 0, err
+	}
+	defer in.Close()
+	out, err := os.Create(dst)
+	if err != nil {
+		return 0, err
+	}
+	defer out.Close()
+	return io.Copy(out, in)
+}
+
 
 func resolveEntry(list []lanzou.ListEntry, target string) (lanzou.ListEntry, bool) {
 	// exact id

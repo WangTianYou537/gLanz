@@ -8,6 +8,7 @@
 package lanzou
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -523,9 +524,9 @@ func (c *Client) Parse(shareURL string, opt Options) (*Result, error) {
 	// Default resolve direct to true for Options{} used carefully:
 	// If caller only sets Password, ResolveDirect is false; fix by DefaultOptions.
 	if opt.ResolveDirect {
-		direct, err := c.ResolveDirectURL(ls.telecom)
+		direct, err := c.resolveDirectWithRetry(ls.telecom, shareURL, 3)
 		if err != nil {
-			direct, err = c.ResolveDirectURL(ls.normal)
+			direct, err = c.resolveDirectWithRetry(ls.normal, shareURL, 2)
 			if err != nil {
 				return nil, err
 			}
@@ -535,24 +536,41 @@ func (c *Client) Parse(shareURL string, opt Options) (*Result, error) {
 	return res, nil
 }
 
+// resolveDirectWithRetry re-parses CDN link with share-page referer and retries on offline HTML.
+func (c *Client) resolveDirectWithRetry(cdnURL, shareURL string, attempts int) (string, error) {
+	if attempts < 1 {
+		attempts = 1
+	}
+	var last error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(time.Duration(i) * 800 * time.Millisecond)
+		}
+		u, err := c.ResolveDirectURL(cdnURL, shareURL)
+		if err == nil {
+			return u, nil
+		}
+		last = err
+	}
+	return "", last
+}
+
 // DefaultOptions returns options with ResolveDirect enabled.
 func DefaultOptions() Options {
 	return Options{ResolveDirect: true}
 }
 
 // ResolveDirectURL turns a CDN pseudo link into a downloadable URL.
-func (c *Client) ResolveDirectURL(cdnURL string) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, cdnURL, nil)
+// shareReferer should be the original share page URL when available.
+//
+// Note: if the first CDN response is already a file stream, this function
+// discards the body and returns cdnURL for a second GET. Prefer
+// DownloadCDN / DownloadShare for large one-shot links.
+func (c *Client) ResolveDirectURL(cdnURL string, shareReferer ...string) (string, error) {
+	req, err := c.newCDNRequest(cdnURL, firstNonEmpty(shareReferer...))
 	if err != nil {
 		return "", err
 	}
-	if c.origin != "" {
-		req.Header.Set("Referer", c.origin+"/")
-	} else {
-		req.Header.Set("Referer", "https://www.lanzou.com/")
-	}
-	req.Header.Set("Accept", "*/*")
-	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
 	resp, err := c.do(req)
 	if err != nil {
 		return "", err
@@ -562,7 +580,7 @@ func (c *Client) ResolveDirectURL(cdnURL string) (string, error) {
 		return "", fmt.Errorf("cdn status %s", resp.Status)
 	}
 	ct := resp.Header.Get("Content-Type")
-	buf := make([]byte, 256)
+	buf := make([]byte, 512)
 	n, _ := io.ReadFull(resp.Body, buf)
 	head := buf[:n]
 	if looksLikeFile(head, ct) {
@@ -572,10 +590,163 @@ func (c *Client) ResolveDirectURL(cdnURL string) (string, error) {
 	rest, _ := io.ReadAll(resp.Body)
 	body := append(head, rest...)
 	text := string(body)
-	if isCDNRiskPage(text) {
+	if code := extractCDNError(text); code != "" {
+		return "", fmt.Errorf("cdn offline ERROR:%s (file may be expired/unavailable)", code)
+	}
+	if isCDNRiskPage(text) || (sub1(reFileTok, text) != "" && reSign.FindStringSubmatch(text) != nil) {
 		return c.resolveViaAjax(cdnURL, text)
 	}
-	return "", fmt.Errorf("unknown CDN response ct=%s head=%q", ct, truncate(string(head), 60))
+	return "", fmt.Errorf("unknown CDN response ct=%s head=%q", ct, truncate(string(head), 80))
+}
+
+func (c *Client) newCDNRequest(cdnURL, shareReferer string) (*http.Request, error) {
+	req, err := http.NewRequest(http.MethodGet, cdnURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if shareReferer != "" {
+		req.Header.Set("Referer", shareReferer)
+	} else if c.origin != "" {
+		req.Header.Set("Referer", c.origin+"/")
+	} else {
+		req.Header.Set("Referer", "https://www.lanzou.com/")
+	}
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	return req, nil
+}
+
+// DownloadShare parses a share link and downloads in one flow, streaming the CDN
+// body when the first response is already the file (avoids one-shot token burn).
+func (c *Client) DownloadShare(shareURL, password, destDir, filename string) (string, error) {
+	var last error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+		// Fresh client state each attempt
+		nc := New()
+		res, err := nc.Parse(shareURL, Options{Password: password, ResolveDirect: false})
+		if err != nil {
+			last = err
+			continue
+		}
+		// Try telecom then normal; stream file on first hit.
+		candidates := []string{res.Telecom, res.Normal}
+		for _, cdn := range candidates {
+			if cdn == "" {
+				continue
+			}
+			path, err := nc.downloadCDNStream(cdn, shareURL, destDir, firstNonEmpty(filename, res.Filename))
+			if err == nil {
+				return path, nil
+			}
+			last = err
+		}
+	}
+	if last == nil {
+		last = fmt.Errorf("download share failed")
+	}
+	return "", last
+}
+
+// downloadCDNStream GETs cdnURL once: if body is file, save it; if risk HTML, ajax then download.
+func (c *Client) downloadCDNStream(cdnURL, shareReferer, destDir, filename string) (string, error) {
+	req, err := c.newCDNRequest(cdnURL, shareReferer)
+	if err != nil {
+		return "", err
+	}
+	// long timeout for large parts
+	oldTO := c.http.Timeout
+	c.http.Timeout = 120 * time.Minute
+	resp, err := c.do(req)
+	c.http.Timeout = oldTO
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("cdn status %s", resp.Status)
+	}
+	ct := resp.Header.Get("Content-Type")
+	buf := make([]byte, 512)
+	n, _ := io.ReadFull(resp.Body, buf)
+	head := buf[:n]
+	if looksLikeFile(head, ct) {
+		// Stream head + rest to disk (single GET).
+		return c.saveDownloadStream(io.MultiReader(bytes.NewReader(head), resp.Body), destDir, filename, resp.ContentLength, resp.Header.Get("Content-Disposition"), cdnURL)
+	}
+	rest, _ := io.ReadAll(resp.Body)
+	body := append(head, rest...)
+	text := string(body)
+	if code := extractCDNError(text); code != "" {
+		return "", fmt.Errorf("cdn offline ERROR:%s (file may be expired/unavailable)", code)
+	}
+	if isCDNRiskPage(text) || (sub1(reFileTok, text) != "" && reSign.FindStringSubmatch(text) != nil) {
+		final, err := c.resolveViaAjax(cdnURL, text)
+		if err != nil {
+			return "", err
+		}
+		// second GET for ajax-resolved real URL (usually allows re-GET)
+		return c.Download(final, destDir, filename, shareReferer)
+	}
+	return "", fmt.Errorf("unknown CDN response ct=%s head=%q", ct, truncate(string(head), 80))
+}
+
+func (c *Client) saveDownloadStream(r io.Reader, destDir, filename string, contentLength int64, contentDisp, rawURL string) (string, error) {
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return "", err
+	}
+	name := filename
+	if name == "" {
+		name = filenameFromCD(contentDisp)
+	}
+	if name == "" {
+		name = filenameFromURL(rawURL)
+	}
+	if name == "" {
+		name = c.filename
+	}
+	if name == "" {
+		name = fmt.Sprintf("lanzou_%d.bin", time.Now().Unix())
+	}
+	name = filepath.Base(name)
+	out := filepath.Join(destDir, name)
+	if _, err := os.Stat(out); err == nil {
+		ext := filepath.Ext(name)
+		stem := strings.TrimSuffix(name, ext)
+		for i := 1; ; i++ {
+			cand := filepath.Join(destDir, fmt.Sprintf("%s(%d)%s", stem, i, ext))
+			if _, err := os.Stat(cand); os.IsNotExist(err) {
+				out = cand
+				break
+			}
+		}
+	}
+	f, err := os.Create(out)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	src := r
+	if contentLength > 0 {
+		src = &progressReader{r: r, total: contentLength, label: name}
+	} else {
+		fmt.Fprintf(os.Stderr, "\r[download] %s  ...", name)
+	}
+	if _, err := io.Copy(f, src); err != nil {
+		return "", err
+	}
+	if contentLength > 0 {
+		fmt.Fprintf(os.Stderr, "\r[download] %s  100.0%%  %s/%s          \n",
+			name, humanBytes(contentLength), humanBytes(contentLength))
+	} else {
+		fmt.Fprintf(os.Stderr, "\r[download] %s  done                    \n", name)
+	}
+	return out, nil
 }
 
 type riskResp struct {
@@ -772,7 +943,21 @@ func humanBytes(n int64) string {
 
 func isCDNRiskPage(html string) bool {
 	return (strings.Contains(html, "ajax.php") && strings.Contains(html, "down_r")) ||
-		(strings.Contains(html, "系统发现您的网络异常") && strings.Contains(html, "ajax.php"))
+		(strings.Contains(html, "系统发现您的网络异常") && strings.Contains(html, "ajax.php")) ||
+		(strings.Contains(html, "ajax.php") && strings.Contains(html, "el"))
+}
+
+// extractCDNError returns code from offline pages like `ERROR:102`.
+func extractCDNError(html string) string {
+	// common: apk_part001.zip<br>ERROR:102<br>
+	re := regexp.MustCompile(`(?i)ERROR\s*[:：]\s*(\d+)`)
+	if m := re.FindStringSubmatch(html); len(m) == 2 {
+		return m[1]
+	}
+	if strings.Contains(html, "class=\"off0\"") || strings.Contains(html, "class=\"off1\"") {
+		return "offline"
+	}
+	return ""
 }
 
 func looksLikeFile(chunk []byte, ct string) bool {
