@@ -151,8 +151,8 @@ Config keys:
 
 Interactive (-i) commands:
   ls|ll|list|dir          list current folder
-  cd <id|name|/|..>       enter folder
-  pwd                     show current folder id
+  cd <name|id|/abs/path|..|.>       enter folder
+  pwd                     show current path (/ or /folder/...)
   download|dl|down|fetch <id|name> [-j N] [-o DIR]
   info|show|stat <id|name>
   upload|up|put <local-path>
@@ -1318,15 +1318,39 @@ func isDigits(s string) bool {
 
 // ---------- interactive shell ----------
 
+type pathSeg struct {
+	ID   string
+	Name string
+}
+
 type shell struct {
-	acc     *lanzou.Account
-	folder  string
-	stack   []string // parent ids for cd ..
-	cookie  string
-	outDir  string
-	jobs    int
-	user    string
-	pass    string
+	acc    *lanzou.Account
+	path   []pathSeg // root = empty; each segment is a folder under parent
+	cookie string
+	outDir string
+	jobs   int
+	user   string
+	pass   string
+}
+
+func (sh *shell) folderID() string {
+	if len(sh.path) == 0 {
+		return "-1"
+	}
+	return sh.path[len(sh.path)-1].ID
+}
+
+// pathString returns display path: "/" or "/foo/bar"
+func (sh *shell) pathString() string {
+	if len(sh.path) == 0 {
+		return "/"
+	}
+	var b strings.Builder
+	for _, s := range sh.path {
+		b.WriteByte('/')
+		b.WriteString(s.Name)
+	}
+	return b.String()
 }
 
 func runInteractive(args []string) {
@@ -1349,8 +1373,7 @@ func runInteractive(args []string) {
 
 	sh := &shell{
 		acc:    acc,
-		folder: "-1",
-		stack:  nil,
+		path:   nil,
 		cookie: *cookie,
 		outDir: *outDir,
 		jobs:   *jobs,
@@ -1361,7 +1384,7 @@ func runInteractive(args []string) {
 	fmt.Println("lanzou interactive shell. type 'help', 'exit' to quit.")
 	in := bufio.NewScanner(os.Stdin)
 	for {
-		fmt.Printf("lanzou:%s> ", sh.folder)
+		fmt.Printf("lanzou:%s> ", sh.pathString())
 		if !in.Scan() {
 			fmt.Println()
 			if err := in.Err(); err != nil {
@@ -1394,7 +1417,7 @@ func (sh *shell) exec(line string) error {
 
 	switch cmd {
 	case "help", "?":
-		fmt.Println("ls|ll|list|dir | cd <id|name|/|..> | pwd")
+		fmt.Println("ls|ll|list|dir | cd <name|id|/abs/path|..|.> | pwd")
 		fmt.Println("download|dl|down|fetch <id|name> [-j N] [-o DIR]")
 		fmt.Println("info|show|stat <id|name> | upload|up|put <path>")
 		fmt.Println("mkdir|md <name> | rm|delete|del|remove <id|name>")
@@ -1404,18 +1427,18 @@ func (sh *shell) exec(line string) error {
 	case "exit", "quit", "q":
 		return errExit
 	case "pwd":
-		fmt.Println(sh.folder)
+		fmt.Println(sh.pathString())
 		return nil
 	case "ls", "ll", "list", "dir":
-		list, err := sh.acc.List(sh.folder)
+		list, err := sh.acc.List(sh.folderID())
 		if err != nil {
 			return err
 		}
-		printList(sh.acc, sh.folder, list, true)
+		printList(sh.acc, sh.pathString(), list, true)
 		return nil
 	case "cd":
 		if len(args) < 1 {
-			return fmt.Errorf("usage: cd <id|name|/|..>")
+			return fmt.Errorf("usage: cd <name|id|/abs/path|..|.>")
 		}
 		return sh.cd(args[0])
 	case "download", "dl", "down", "fetch", "get":
@@ -1429,7 +1452,7 @@ func (sh *shell) exec(line string) error {
 		if len(args) < 1 {
 			return fmt.Errorf("usage: upload <local-path>")
 		}
-		res, err := sh.acc.Upload(args[0], sh.folder)
+		res, err := sh.acc.Upload(args[0], sh.folderID())
 		if err != nil {
 			return err
 		}
@@ -1439,7 +1462,7 @@ func (sh *shell) exec(line string) error {
 		if len(args) < 1 {
 			return fmt.Errorf("usage: mkdir <name>")
 		}
-		_, err := sh.acc.CreateFolder(args[0], sh.folder, "")
+		_, err := sh.acc.CreateFolder(args[0], sh.folderID(), "")
 		if err != nil {
 			return err
 		}
@@ -1466,40 +1489,64 @@ func (sh *shell) exec(line string) error {
 }
 
 func (sh *shell) cd(target string) error {
-	if target == "/" || target == "~" || target == "root" {
-		sh.folder = "-1"
-		sh.stack = nil
+	target = strings.TrimSpace(target)
+	if target == "" || target == "." {
 		return nil
 	}
-	if target == ".." {
-		if len(sh.stack) == 0 {
-			sh.folder = "-1"
+	// absolute path
+	if strings.HasPrefix(target, "/") || target == "~" || target == "root" {
+		sh.path = nil
+		rest := strings.TrimPrefix(target, "/")
+		if target == "~" || target == "root" {
+			rest = ""
+		}
+		if rest == "" {
 			return nil
 		}
-		sh.folder = sh.stack[len(sh.stack)-1]
-		sh.stack = sh.stack[:len(sh.stack)-1]
-		return nil
+		return sh.cdRelative(rest)
 	}
-	list, err := sh.acc.List(sh.folder)
-	if err != nil {
-		return err
-	}
-	e, ok := resolveEntry(list, target)
-	if !ok {
-		// allow raw folder id
-		if isDigits(target) {
-			sh.stack = append(sh.stack, sh.folder)
-			sh.folder = target
-			return nil
+	return sh.cdRelative(target)
+}
+
+// cdRelative walks path components from current location (supports a/b, .., names, ids).
+func (sh *shell) cdRelative(rel string) error {
+	// normalize separators
+	rel = strings.ReplaceAll(rel, "\\", "/")
+	parts := strings.Split(rel, "/")
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" || p == "." {
+			continue
 		}
-		return fmt.Errorf("folder not found: %s", target)
+		if p == ".." {
+			if len(sh.path) > 0 {
+				sh.path = sh.path[:len(sh.path)-1]
+			}
+			continue
+		}
+		cur := sh.folderID()
+		list, err := sh.acc.List(cur)
+		if err != nil {
+			return err
+		}
+		e, ok := resolveEntry(list, p)
+		if !ok {
+			if isDigits(p) {
+				// raw folder id: keep id as display name if unknown
+				name := p
+				if info, err := sh.acc.GetFolderInfo(p); err == nil && info.Name != "" {
+					name = info.Name
+				}
+				sh.path = append(sh.path, pathSeg{ID: p, Name: name})
+				continue
+			}
+			return fmt.Errorf("folder not found: %s (at %s)", p, sh.pathString())
+		}
+		if e.Type != lanzou.EntryFolder {
+			return fmt.Errorf("%s is a file, not a folder", e.Name)
+		}
+		sh.path = append(sh.path, pathSeg{ID: e.ID, Name: e.Name})
 	}
-	if e.Type != lanzou.EntryFolder {
-		return fmt.Errorf("%s is a file, not a folder", e.Name)
-	}
-	sh.stack = append(sh.stack, sh.folder)
-	sh.folder = e.ID
-	fmt.Println("cd ->", e.Name, "("+e.ID+")")
 	return nil
 }
 
@@ -1526,11 +1573,11 @@ func (sh *shell) cmdDownload(args []string) error {
 			}
 		}
 	}
-	return downloadTarget(sh.acc, sh.folder, target, outDir, jobs)
+	return downloadTarget(sh.acc, sh.folderID(), target, outDir, jobs)
 }
 
 func (sh *shell) cmdInfo(target string) error {
-	list, err := sh.acc.List(sh.folder)
+	list, err := sh.acc.List(sh.folderID())
 	if err != nil {
 		return err
 	}
@@ -1577,7 +1624,7 @@ func (sh *shell) cmdInfo(target string) error {
 }
 
 func (sh *shell) cmdRm(target string) error {
-	return deleteTarget(sh.acc, sh.folder, target)
+	return deleteTarget(sh.acc, sh.folderID(), target)
 }
 
 func (sh *shell) cmdLogin(args []string) error {
