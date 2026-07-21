@@ -64,6 +64,8 @@ func main() {
 		runPasswd(os.Args[2:])
 	case "download", "dl":
 		runDownload(os.Args[2:])
+	case "config":
+		runConfig(os.Args[2:])
 	case "interactive", "i", "shell":
 		runInteractive(os.Args[2:])
 	case "help", "-h", "--help":
@@ -121,9 +123,21 @@ Usage:
   lanzou rm --file ID | --folder ID
   lanzou info --file ID | --folder ID
   lanzou passwd --file ID --pwd XXX
+  lanzou config [list|get KEY|set KEY VALUE|path|reset]
 
 Default cookie file: ~/.lanzou/cookie
-(override with --cookie / -c or env LANZOU_COOKIE)
+Default config file: ~/.lanzou/config.json
+(override with --cookie / -c or env LANZOU_COOKIE / LANZOU_CONFIG)
+
+Config keys:
+  suffix_auto_convert  bool   auto convert blocked suffix (default true)
+  suffix_name          string target ext, no dot (default zip)
+  suffix_mode          zip|rename  compress vs rename-only
+  split_enable         bool   split large files (default true)
+  split_size_mb        int    chunk size MB 1..100 (default 90)
+  split_name_format    string e.g. {name}_part{index:03d}.{suffix}
+  split_note           bool   write part meta to file desc (default true)
+  list_unescape        bool   group split parts in ls (default true)
 
 Interactive (-i) commands:
   ls / ll                 list current folder
@@ -279,6 +293,7 @@ func runList(args []string) {
 	fs := pflag.NewFlagSet("list", pflag.ExitOnError)
 	user, pass, cookie := accountFlags(fs)
 	folder := fs.String("folder", "-1", "folder id (-1 = root)")
+	raw := fs.Bool("raw", false, "disable list_unescape grouping")
 	_ = fs.Parse(args)
 	acc := openAccount(*user, *pass, *cookie, true)
 	list, err := acc.List(*folder)
@@ -286,21 +301,42 @@ func runList(args []string) {
 		fmt.Fprintln(os.Stderr, "[error]", err)
 		os.Exit(1)
 	}
-	printList(*folder, list)
+	printList(acc, *folder, list, !*raw)
 }
 
-func printList(folder string, list []lanzou.ListEntry) {
-	fmt.Printf("folder=%s  entries=%d\n", folder, len(list))
-	for _, e := range list {
-		kind := "FILE"
-		if e.Type == lanzou.EntryFolder {
+func printList(acc *lanzou.Account, folder string, list []lanzou.ListEntry, unescape bool) {
+	cfg := lanzou.GetConfig()
+	doUnescape := unescape && cfg.ListUnescape
+	var notes map[string]string
+	if doUnescape {
+		// only fetch notes when there might be parts (best-effort)
+		notes = acc.FetchNotes(list)
+	}
+	rows := lanzou.UnescapeList(list, notes, doUnescape)
+	fmt.Printf("folder=%s  entries=%d", folder, len(list))
+	if doUnescape && len(rows) != len(list) {
+		fmt.Printf("  display=%d", len(rows))
+	}
+	fmt.Println()
+	for _, e := range rows {
+		kind := e.Kind
+		if kind == "DIR" {
 			kind = "DIR "
+		} else if kind == "FILE" {
+			kind = "FILE"
+		} else if kind == "SPLIT" {
+			kind = "SPLIT"
 		}
-		extra := e.Size
-		if e.Type == lanzou.EntryFolder {
-			extra = e.Description
+		extra := e.Extra
+		if extra == "" {
+			extra = e.Size
 		}
 		fmt.Printf("  [%s] id=%-12s  %s  %s\n", kind, e.ID, e.Name, extra)
+		if e.Kind == "SPLIT" {
+			for _, p := range e.Parts {
+				fmt.Printf("           └─ id=%-12s  %s  %s\n", p.ID, p.Name, p.Size)
+			}
+		}
 	}
 }
 
@@ -317,9 +353,21 @@ func runUpload(args []string) {
 	}
 	local := fs.Arg(0)
 	acc := openAccount(*user, *pass, *cookie, true)
-	// Hint when suffix is not on server whitelist (library will auto-zip).
+	cfg := lanzou.GetConfig()
 	if ext := filepath.Ext(local); ext != "" && !lanzou.IsUploadAllowedExt(ext) {
-		fmt.Printf("[upload] suffix %s not allowed by server, will pack as .zip\n", strings.ToLower(ext))
+		if cfg.SuffixAutoConvert {
+			fmt.Printf("[upload] suffix %s not allowed; convert mode=%s -> .%s\n",
+				strings.ToLower(ext), cfg.SuffixMode, cfg.SuffixName)
+		} else {
+			fmt.Printf("[upload] suffix %s not allowed (suffix_auto_convert=false)\n", strings.ToLower(ext))
+		}
+	}
+	if st, err := os.Stat(local); err == nil {
+		limit := int64(cfg.SplitSizeMB) * 1024 * 1024
+		if cfg.SplitEnable && st.Size() > limit {
+			fmt.Printf("[upload] size %d > %dMB, will split (format=%s)\n",
+				st.Size(), cfg.SplitSizeMB, cfg.SplitNameFormat)
+		}
 	}
 	fmt.Println("[upload]", local, "-> folder", *folder)
 	res, err := acc.Upload(local, *folder)
@@ -327,24 +375,115 @@ func runUpload(args []string) {
 		fmt.Fprintln(os.Stderr, "[error]", err)
 		os.Exit(1)
 	}
-	fmt.Println("[ok] uploaded id=", res.FileID, "name=", res.Name)
+	if len(res.Parts) > 0 {
+		fmt.Printf("[ok] uploaded %d parts  group=%s  orig=%s\n", len(res.Parts), res.GroupID, res.OrigName)
+		for _, p := range res.Parts {
+			fmt.Printf("  part %d/%d id=%s name=%s size=%d\n", p.Index, p.Total, p.FileID, p.Name, p.Size)
+		}
+	} else {
+		fmt.Println("[ok] uploaded id=", res.FileID, "name=", res.Name)
+	}
 	if *setPwd != "" && res.FileID != "" {
 		if _, err := acc.SetFilePassword(res.FileID, *setPwd); err != nil {
 			fmt.Fprintln(os.Stderr, "[warn] set password:", err)
 		}
 	}
-	if *setDesc != "" && res.FileID != "" {
+	// set-desc only for non-split (split uses structured notes)
+	if *setDesc != "" && res.FileID != "" && len(res.Parts) == 0 {
 		if _, err := acc.SetFileDescribe(res.FileID, *setDesc); err != nil {
 			fmt.Fprintln(os.Stderr, "[warn] set desc:", err)
 		}
 	}
-	if res.FileID != "" {
+	if res.FileID != "" && len(res.Parts) == 0 {
 		if share, pwd, err := acc.GetFileDownloadInfo(res.FileID); err == nil {
 			fmt.Println("  share:", share)
 			if pwd != "" {
 				fmt.Println("  share_pwd:", pwd)
 			}
 		}
+	}
+}
+
+func runConfig(args []string) {
+	if len(args) == 0 {
+		args = []string{"list"}
+	}
+	sub := args[0]
+	switch sub {
+	case "list", "show", "ls":
+		cfg := lanzou.GetConfig()
+		fmt.Println("config:", lanzou.ConfigPathUsed())
+		for _, kv := range lanzou.ConfigKeys() {
+			v, _ := lanzou.GetConfigValue(cfg, kv[0])
+			fmt.Printf("  %-20s = %-10s  # %s\n", kv[0], v, kv[1])
+		}
+	case "get":
+		if len(args) < 2 {
+			fmt.Fprintln(os.Stderr, "usage: lanzou config get <key>")
+			os.Exit(1)
+		}
+		cfg := lanzou.GetConfig()
+		v, err := lanzou.GetConfigValue(cfg, args[1])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "[error]", err)
+			os.Exit(1)
+		}
+		fmt.Println(v)
+	case "set":
+		if len(args) < 3 {
+			fmt.Fprintln(os.Stderr, "usage: lanzou config set <key> <value>")
+			os.Exit(1)
+		}
+		cfg := lanzou.GetConfig()
+		cfg, err := lanzou.SetConfigValue(cfg, args[1], args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "[error]", err)
+			os.Exit(1)
+		}
+		if err := lanzou.SaveConfig("", cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "[error] save:", err)
+			os.Exit(1)
+		}
+		v, _ := lanzou.GetConfigValue(cfg, args[1])
+		fmt.Printf("[ok] %s = %s\n  saved: %s\n", args[1], v, lanzou.ConfigPathUsed())
+	case "path":
+		fmt.Println(lanzou.ConfigPathUsed())
+	case "reset":
+		cfg := lanzou.DefaultConfig()
+		if err := lanzou.SaveConfig("", cfg); err != nil {
+			fmt.Fprintln(os.Stderr, "[error]", err)
+			os.Exit(1)
+		}
+		fmt.Println("[ok] reset to defaults ->", lanzou.ConfigPathUsed())
+	case "help", "-h", "--help":
+		fmt.Println("lanzou config list")
+		fmt.Println("lanzou config get <key>")
+		fmt.Println("lanzou config set <key> <value>")
+		fmt.Println("lanzou config path")
+		fmt.Println("lanzou config reset")
+		fmt.Println()
+		for _, kv := range lanzou.ConfigKeys() {
+			fmt.Printf("  %-20s  %s\n", kv[0], kv[1])
+		}
+	default:
+		// allow: lanzou config suffix_auto_convert true
+		if len(args) == 2 {
+			cfg := lanzou.GetConfig()
+			cfg, err := lanzou.SetConfigValue(cfg, args[0], args[1])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "[error]", err)
+				os.Exit(1)
+			}
+			if err := lanzou.SaveConfig("", cfg); err != nil {
+				fmt.Fprintln(os.Stderr, "[error] save:", err)
+				os.Exit(1)
+			}
+			v, _ := lanzou.GetConfigValue(cfg, args[0])
+			fmt.Printf("[ok] %s = %s\n", args[0], v)
+			return
+		}
+		fmt.Fprintf(os.Stderr, "unknown config subcommand: %s\n", sub)
+		os.Exit(1)
 	}
 }
 
@@ -753,7 +892,7 @@ func (sh *shell) exec(line string) error {
 		if err != nil {
 			return err
 		}
-		printList(sh.folder, list)
+		printList(sh.acc, sh.folder, list, true)
 		return nil
 	case "cd":
 		if len(args) < 1 {

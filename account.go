@@ -61,9 +61,12 @@ func IsUploadAllowedExt(ext string) bool {
 }
 
 // zipSingleFile packs src into a temporary .zip containing one entry (basename).
-// Caller must remove the returned path when done.
-func zipSingleFile(src string) (zipPath string, zipName string, err error) {
+// uploadName is the remote filename (base + "." + suffixName).
+func zipSingleFile(src, suffixName string) (zipPath string, uploadName string, err error) {
 	base := filepath.Base(src)
+	if suffixName == "" {
+		suffixName = "zip"
+	}
 	tmp, err := os.CreateTemp("", "lanzou-up-*.zip")
 	if err != nil {
 		return "", "", err
@@ -101,50 +104,158 @@ func zipSingleFile(src string) (zipPath string, zipName string, err error) {
 		os.Remove(zipPath)
 		return "", "", err
 	}
-	// e.g. classes2.dex -> classes2.dex.zip
-	zipName = base + ".zip"
-	return zipPath, zipName, nil
+	uploadName = base + "." + suffixName
+	return zipPath, uploadName, nil
 }
 
-// prepareUploadPath validates size/ext. Unsupported suffixes are auto-zipped.
-// cleanup removes a temp zip if one was created (no-op otherwise).
-func prepareUploadPath(localPath string) (uploadPath, uploadName string, cleanup func(), err error) {
-	cleanup = func() {}
-	st, err := os.Stat(localPath)
+// renameCopy creates a temp copy of src (no compression). Remote name is separate.
+func renameCopy(src string) (path string, err error) {
+	tmp, err := os.CreateTemp("", "lanzou-up-*")
 	if err != nil {
-		return "", "", cleanup, err
+		return "", err
 	}
-	if st.IsDir() {
-		return "", "", cleanup, fmt.Errorf("path is a directory: %s", localPath)
+	path = tmp.Name()
+	f, err := os.Open(src)
+	if err != nil {
+		tmp.Close()
+		os.Remove(path)
+		return "", err
 	}
-	if st.Size() > maxUploadBytes {
-		return "", "", cleanup, fmt.Errorf(
-			"file too large: %d bytes (max %d MB)", st.Size(), maxUploadBytes/(1024*1024),
-		)
+	if _, err := io.Copy(tmp, f); err != nil {
+		f.Close()
+		tmp.Close()
+		os.Remove(path)
+		return "", err
 	}
+	f.Close()
+	if err := tmp.Close(); err != nil {
+		os.Remove(path)
+		return "", err
+	}
+	return path, nil
+}
+
+// convertSuffix applies suffix_auto_convert policy to a single file that is
+// already ≤ max upload size. Returns path + remote name + cleanup.
+func convertSuffix(localPath string, cfg Config) (uploadPath, uploadName string, cleanup func(), err error) {
+	cleanup = func() {}
 	name := filepath.Base(localPath)
 	if IsUploadAllowedExt(fileExt(name)) {
 		return localPath, name, cleanup, nil
 	}
-	// Auto wrap unsupported suffix (e.g. .dex) into .zip
-	zp, zn, err := zipSingleFile(localPath)
-	if err != nil {
-		return "", "", cleanup, fmt.Errorf("zip unsupported ext .%s: %w", fileExt(name), err)
-	}
-	// re-check zipped size
-	zst, err := os.Stat(zp)
-	if err != nil {
-		os.Remove(zp)
-		return "", "", cleanup, err
-	}
-	if zst.Size() > maxUploadBytes {
-		os.Remove(zp)
+	if !cfg.SuffixAutoConvert {
 		return "", "", cleanup, fmt.Errorf(
-			"zipped file too large: %d bytes (max %d MB)", zst.Size(), maxUploadBytes/(1024*1024),
+			"suffix .%s not allowed by server (set suffix_auto_convert=true or rename)",
+			fileExt(name),
 		)
 	}
-	cleanup = func() { _ = os.Remove(zp) }
-	return zp, zn, cleanup, nil
+	suffix := cfg.SuffixName
+	if suffix == "" {
+		suffix = "zip"
+	}
+	if !IsUploadAllowedExt(suffix) {
+		return "", "", cleanup, fmt.Errorf("configured suffix_name .%s is not on server whitelist", suffix)
+	}
+	switch cfg.SuffixMode {
+	case "rename":
+		uploadName = name + "." + suffix
+		p, err := renameCopy(localPath)
+		if err != nil {
+			return "", "", cleanup, err
+		}
+		cleanup = func() { _ = os.Remove(p) }
+		return p, uploadName, cleanup, nil
+	default: // zip
+		zp, zn, err := zipSingleFile(localPath, suffix)
+		if err != nil {
+			return "", "", cleanup, fmt.Errorf("zip unsupported ext .%s: %w", fileExt(name), err)
+		}
+		cleanup = func() { _ = os.Remove(zp) }
+		return zp, zn, cleanup, nil
+	}
+}
+
+// splitFile writes raw chunks of localPath into temp files of at most chunkBytes.
+func splitFile(localPath string, chunkBytes int64) (paths []string, sizes []int64, cleanup func(), err error) {
+	cleanup = func() {
+		for _, p := range paths {
+			_ = os.Remove(p)
+		}
+	}
+	f, err := os.Open(localPath)
+	if err != nil {
+		return nil, nil, cleanup, err
+	}
+	defer f.Close()
+	buf := make([]byte, 1024*1024)
+	var idx int
+	for {
+		tmp, err := os.CreateTemp("", fmt.Sprintf("lanzou-part-%d-*.bin", idx))
+		if err != nil {
+			cleanup()
+			return nil, nil, func() {}, err
+		}
+		var written int64
+		for written < chunkBytes {
+			toRead := int64(len(buf))
+			if left := chunkBytes - written; left < toRead {
+				toRead = left
+			}
+			n, rerr := f.Read(buf[:toRead])
+			if n > 0 {
+				if _, werr := tmp.Write(buf[:n]); werr != nil {
+					tmp.Close()
+					cleanup()
+					return nil, nil, func() {}, werr
+				}
+				written += int64(n)
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				tmp.Close()
+				cleanup()
+				return nil, nil, func() {}, rerr
+			}
+		}
+		if err := tmp.Close(); err != nil {
+			cleanup()
+			return nil, nil, func() {}, err
+		}
+		if written == 0 {
+			_ = os.Remove(tmp.Name())
+			break
+		}
+		paths = append(paths, tmp.Name())
+		sizes = append(sizes, written)
+		idx++
+		// peek: if EOF already drained, next loop will write 0
+		// check remaining by attempting non-destructive? just continue; zero write breaks
+		if written < chunkBytes {
+			// last partial chunk
+			break
+		}
+	}
+	if len(paths) == 0 {
+		return nil, nil, cleanup, fmt.Errorf("empty file, nothing to split")
+	}
+	return paths, sizes, cleanup, nil
+}
+
+// isArchiveSuffix reports suffixes the server may content-validate as archives.
+func isArchiveSuffix(ext string) bool {
+	switch strings.ToLower(strings.TrimPrefix(ext, ".")) {
+	case "zip", "rar", "7z", "tar":
+		return true
+	default:
+		return false
+	}
+}
+
+// newPartGroupID builds a short unique group id for split notes.
+func newPartGroupID() string {
+	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
 
 // Account is a logged-in Lanzou control-panel client.
@@ -641,33 +752,217 @@ func (a *Account) DeleteFile(fileID string) (string, error) {
 	return a.postTask("task=6&file_id=" + url.QueryEscape(fileID))
 }
 
-// UploadResult is the outcome of a successful Upload.
+// UploadResult is the outcome of a successful Upload (single or multi-part).
 type UploadResult struct {
-	FileID   string
-	Name     string
+	FileID   string // first / only file id
+	Name     string // first / only remote name
 	RawJSON  string
 	FolderID string
+	// Parts is non-empty when the file was split.
+	Parts []UploadPart `json:"parts,omitempty"`
+	// OrigName is the original local basename.
+	OrigName string `json:"orig_name,omitempty"`
+	// GroupID links split parts via file description.
+	GroupID string `json:"group_id,omitempty"`
+}
+
+// UploadPart is one chunk of a split upload.
+type UploadPart struct {
+	FileID string
+	Name   string
+	Index  int
+	Total  int
+	Size   int64
 }
 
 // Upload uploads a local file to folderID ("-1" = root) via html5up.php.
-// Matches browser HTML5 upload:
 //
-//	POST https://pc.woozooo.com/html5up.php
-//	multipart: task=1, folder_id=<id>, upload_file=@file
+// Behaviour is controlled by GetConfig():
+//   - suffix_auto_convert / suffix_name / suffix_mode for blocked extensions
+//   - split_enable / split_size_mb / split_name_format / split_note for large files
 //
-// Server limits: max 100MB; restricted suffix whitelist. Unsupported suffixes
-// (e.g. .dex) are automatically packed into a .zip before upload.
+// Server hard limit remains 100MB per request.
 func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 	if folderID == "" {
 		folderID = "-1"
 	}
-	uploadPath, filename, cleanup, err := prepareUploadPath(localPath)
+	cfg := GetConfig()
+	st, err := os.Stat(localPath)
+	if err != nil {
+		return nil, err
+	}
+	if st.IsDir() {
+		return nil, fmt.Errorf("path is a directory: %s", localPath)
+	}
+	origName := filepath.Base(localPath)
+	size := st.Size()
+	chunkBytes := int64(cfg.SplitSizeMB) * 1024 * 1024
+	if chunkBytes < 1 {
+		chunkBytes = 90 * 1024 * 1024
+	}
+	if chunkBytes > maxUploadBytes {
+		chunkBytes = maxUploadBytes
+	}
+
+	// Decide whether to split.
+	needSplit := cfg.SplitEnable && size > chunkBytes
+	if !cfg.SplitEnable && size > maxUploadBytes {
+		return nil, fmt.Errorf(
+			"file too large: %d bytes (max %d MB; enable split_enable or shrink file)",
+			size, maxUploadBytes/(1024*1024),
+		)
+	}
+
+	if !needSplit {
+		// Single-file path: convert suffix if needed, then upload once.
+		upPath, upName, cleanup, err := convertSuffix(localPath, cfg)
+		if err != nil {
+			return nil, err
+		}
+		defer cleanup()
+		// After convert, size may grow (zip); enforce limit.
+		ust, err := os.Stat(upPath)
+		if err != nil {
+			return nil, err
+		}
+		if ust.Size() > maxUploadBytes {
+			if !cfg.SplitEnable {
+				return nil, fmt.Errorf(
+					"converted file too large: %d bytes (max %d MB)",
+					ust.Size(), maxUploadBytes/(1024*1024),
+				)
+			}
+			// Fall through to split the converted file.
+			needSplit = true
+			localPath = upPath
+			// keep cleanup for later — restructure
+			return a.uploadSplit(upPath, origName, folderID, cfg, chunkBytes, cleanup)
+		}
+		res, err := a.uploadOne(upPath, upName, folderID)
+		if err != nil {
+			return nil, err
+		}
+		res.OrigName = origName
+		return res, nil
+	}
+
+	return a.uploadSplit(localPath, origName, folderID, cfg, chunkBytes, func() {})
+}
+
+// uploadSplit splits localPath into chunks, converts each, uploads, writes notes.
+func (a *Account) uploadSplit(
+	localPath, origName, folderID string,
+	cfg Config, chunkBytes int64, parentCleanup func(),
+) (*UploadResult, error) {
+	defer parentCleanup()
+	paths, sizes, cleanup, err := splitFile(localPath, chunkBytes)
 	if err != nil {
 		return nil, err
 	}
 	defer cleanup()
+	total := len(paths)
+	groupID := newPartGroupID()
+	suffix := cfg.SuffixName
+	if suffix == "" {
+		suffix = "zip"
+	}
+	// Part names always use a whitelist suffix so each chunk is uploadable.
+	// Raw binary chunks have no ext → always convert.
+	parts := make([]UploadPart, 0, total)
+	var first *UploadResult
 
-	f, err := os.Open(uploadPath)
+	for i, p := range paths {
+		index := i + 1
+		partName := FormatSplitName(cfg.SplitNameFormat, origName, index, total, suffix)
+		// Ensure partName ends with allowed ext
+		if !IsUploadAllowedExt(fileExt(partName)) {
+			partName = partName + "." + suffix
+		}
+
+		var upPath, upName string
+		var partCleanup func()
+		// For archive suffixes under zip mode, wrap chunk in a real zip so the
+		// server accepts the extension. Otherwise rename-only.
+		needRealZip := cfg.SuffixMode == "zip" && isArchiveSuffix(suffix)
+		if needRealZip {
+			// zip content entry uses a stable inner name
+			zp, zn, err := zipSingleFile(p, suffix)
+			if err != nil {
+				return nil, err
+			}
+			// Override remote name with template (stem may differ)
+			upPath = zp
+			upName = partName
+			if fileExt(upName) != suffix {
+				upName = strings.TrimSuffix(upName, filepath.Ext(upName)) + "." + suffix
+			}
+			// zipSingleFile names as base(p)+"."+suffix; we want template name
+			// Re-zip with desired outer name by just using partName as multipart name
+			// while file on disk is real zip bytes — OK.
+			_ = zn
+			partCleanup = func() { _ = os.Remove(zp) }
+		} else {
+			upName = partName
+			if !IsUploadAllowedExt(fileExt(upName)) {
+				upName = upName + "." + suffix
+			}
+			cp, err := renameCopy(p)
+			if err != nil {
+				return nil, err
+			}
+			upPath = cp
+			partCleanup = func() { _ = os.Remove(cp) }
+		}
+		// Enforce per-request size
+		ust, err := os.Stat(upPath)
+		if err != nil {
+			partCleanup()
+			return nil, err
+		}
+		if ust.Size() > maxUploadBytes {
+			partCleanup()
+			return nil, fmt.Errorf("part %d too large after convert: %d bytes", index, ust.Size())
+		}
+		res, err := a.uploadOne(upPath, upName, folderID)
+		partCleanup()
+		if err != nil {
+			return nil, fmt.Errorf("upload part %d/%d: %w", index, total, err)
+		}
+		if cfg.SplitNote && res.FileID != "" {
+			note := FormatPartNote(groupID, origName, index, total, sizes[i])
+			if _, nerr := a.SetFileDescribe(res.FileID, note); nerr != nil {
+				// non-fatal
+				fmt.Fprintf(os.Stderr, "[warn] set part note %d: %v\n", index, nerr)
+			}
+		}
+		parts = append(parts, UploadPart{
+			FileID: res.FileID,
+			Name:   res.Name,
+			Index:  index,
+			Total:  total,
+			Size:   sizes[i],
+		})
+		if first == nil {
+			first = res
+		}
+	}
+	if first == nil {
+		return nil, fmt.Errorf("split upload produced no parts")
+	}
+	return &UploadResult{
+		FileID:   first.FileID,
+		Name:     first.Name,
+		RawJSON:  first.RawJSON,
+		FolderID: folderID,
+		Parts:    parts,
+		OrigName: origName,
+		GroupID:  groupID,
+	}, nil
+}
+
+// uploadOne POSTs a single local file with the given remote filename.
+func (a *Account) uploadOne(localPath, filename, folderID string) (*UploadResult, error) {
+	f, err := os.Open(localPath)
 	if err != nil {
 		return nil, err
 	}
@@ -749,7 +1044,6 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 		}
 		fileID := ""
 		name := filename
-		// html5up may return text as object or array
 		switch text := js["text"].(type) {
 		case []any:
 			if len(text) > 0 {
@@ -770,7 +1064,6 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 				name = n
 			}
 		}
-		// some responses put id at top-level
 		if fileID == "" {
 			fileID = anyString(js["id"])
 			if fileID == "" {
