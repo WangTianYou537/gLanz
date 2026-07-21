@@ -48,31 +48,31 @@ func main() {
 
 	cmd := os.Args[1]
 	switch cmd {
-	case "parse", "get":
+	case "parse", "get", "p":
 		runParse(os.Args[2:])
-	case "login":
+	case "login", "signin", "auth":
 		runLogin(os.Args[2:])
-	case "logout":
+	case "logout", "signout":
 		runLogout(os.Args[2:])
-	case "list", "ls":
+	case "list", "ls", "ll", "dir":
 		runList(os.Args[2:])
-	case "upload", "up":
+	case "upload", "up", "put":
 		runUpload(os.Args[2:])
-	case "mkdir":
+	case "mkdir", "md":
 		runMkdir(os.Args[2:])
-	case "rm", "delete":
+	case "rm", "delete", "del", "remove", "unlink":
 		runDelete(os.Args[2:])
-	case "info":
+	case "info", "show", "stat":
 		runInfo(os.Args[2:])
-	case "passwd", "password":
+	case "passwd", "password", "pwdset":
 		runPasswd(os.Args[2:])
-	case "download", "dl":
+	case "download", "dl", "down", "fetch":
 		runDownload(os.Args[2:])
-	case "config":
+	case "config", "conf", "cfg", "settings":
 		runConfig(os.Args[2:])
-	case "interactive", "i", "shell":
+	case "interactive", "i", "shell", "sh", "repl":
 		runInteractive(os.Args[2:])
-	case "version":
+	case "version", "ver":
 		fmt.Println("lanzou", lanzou.Version)
 	case "help", "-h", "--help":
 		printRootHelp()
@@ -117,20 +117,20 @@ func printRootHelp() {
 
 Usage:
   lanzou -i                              # interactive shell
-  lanzou --version
+  lanzou --version / -V / version
   lanzou <share-url> [flags]             # parse share (legacy)
-  lanzou parse <share-url> [flags]
-  lanzou login --user U --pass P
+  lanzou parse|get|p <share-url> [flags]
+  lanzou login|signin|auth --user U --pass P
   lanzou login --cookie-str "PHPSESSID=...; phpdisk_info=..."
-  lanzou logout
-  lanzou list [--folder ID]
-  lanzou upload <file> [--folder ID]
-  lanzou download <id|name> [--folder ID] [-o DIR] [-j N]
-  lanzou mkdir <name> [--folder parentID]
-  lanzou rm --file ID | --folder ID
-  lanzou info --file ID | --folder ID
-  lanzou passwd --file ID --pwd XXX
-  lanzou config [list|get KEY|set KEY VALUE|path|reset]
+  lanzou logout|signout
+  lanzou list|ls|ll|dir [--folder ID]
+  lanzou upload|up|put <file> [--folder ID]
+  lanzou download|dl|down|fetch <id|name> [--folder ID] [-o DIR] [-j N]
+  lanzou mkdir|md <name> [--folder parentID]
+  lanzou rm|delete|del|remove --file ID | --folder ID
+  lanzou info|show|stat --file ID | --folder ID
+  lanzou passwd|password|pwdset --file ID --pwd XXX
+  lanzou config|conf|cfg [list|get KEY|set KEY VALUE|path|reset]
 
 Default cookie file: ~/.lanzou/cookie
 Default config file: ~/.lanzou/config.json
@@ -147,16 +147,17 @@ Config keys:
   list_unescape        bool   group split parts in ls (default true)
 
 Interactive (-i) commands:
-  ls / ll                 list current folder
+  ls|ll|list|dir          list current folder
   cd <id|name|/|..>       enter folder
   pwd                     show current folder id
-  download <id|name> [-j N] [-o DIR]
-  info <id|name>
-  upload <local-path>
-  mkdir <name>
-  rm <id|name>
-  login / logout
-  help / exit / quit
+  download|dl|down|fetch <id|name> [-j N] [-o DIR]
+  info|show|stat <id|name>
+  upload|up|put <local-path>
+  mkdir|md <name>
+  rm|delete|del|remove <id|name>
+  login|signin / logout|signout
+  config|conf|cfg ...
+  help / exit|quit|q
 
 Share flags:
   -p, --pwd string         share password
@@ -885,16 +886,19 @@ func (sh *shell) exec(line string) error {
 
 	switch cmd {
 	case "help", "?":
-		fmt.Println("ls | cd <id|name|/|..> | pwd | download <id|name> [-j N] [-o DIR]")
-		fmt.Println("info <id|name> | upload <path> | mkdir <name> | rm <id|name>")
-		fmt.Println("login [--user U --pass P] | logout | exit")
+		fmt.Println("ls|ll|list|dir | cd <id|name|/|..> | pwd")
+		fmt.Println("download|dl|down|fetch <id|name> [-j N] [-o DIR]")
+		fmt.Println("info|show|stat <id|name> | upload|up|put <path>")
+		fmt.Println("mkdir|md <name> | rm|delete|del|remove <id|name>")
+		fmt.Println("login|signin [--user U --pass P] | logout|signout")
+		fmt.Println("config|conf|cfg [list|get|set ...] | exit|quit|q")
 		return nil
 	case "exit", "quit", "q":
 		return errExit
 	case "pwd":
 		fmt.Println(sh.folder)
 		return nil
-	case "ls", "ll", "list":
+	case "ls", "ll", "list", "dir":
 		list, err := sh.acc.List(sh.folder)
 		if err != nil {
 			return err
@@ -906,14 +910,14 @@ func (sh *shell) exec(line string) error {
 			return fmt.Errorf("usage: cd <id|name|/|..>")
 		}
 		return sh.cd(args[0])
-	case "download", "dl", "get":
+	case "download", "dl", "down", "fetch", "get":
 		return sh.cmdDownload(args)
-	case "info":
+	case "info", "show", "stat":
 		if len(args) < 1 {
 			return fmt.Errorf("usage: info <id|name>")
 		}
 		return sh.cmdInfo(args[0])
-	case "upload", "up":
+	case "upload", "up", "put":
 		if len(args) < 1 {
 			return fmt.Errorf("usage: upload <local-path>")
 		}
@@ -923,7 +927,7 @@ func (sh *shell) exec(line string) error {
 		}
 		fmt.Println("[ok] uploaded", res.FileID, res.Name)
 		return nil
-	case "mkdir":
+	case "mkdir", "md":
 		if len(args) < 1 {
 			return fmt.Errorf("usage: mkdir <name>")
 		}
@@ -933,17 +937,20 @@ func (sh *shell) exec(line string) error {
 		}
 		fmt.Println("[ok] mkdir", args[0])
 		return nil
-	case "rm", "delete":
+	case "rm", "delete", "del", "remove", "unlink":
 		if len(args) < 1 {
 			return fmt.Errorf("usage: rm <id|name>")
 		}
 		return sh.cmdRm(args[0])
-	case "login":
+	case "login", "signin", "auth":
 		return sh.cmdLogin(args)
-	case "logout":
+	case "logout", "signout":
 		_ = os.Remove(sh.cookie)
 		sh.acc.SetCookie("")
 		fmt.Println("[ok] logged out")
+		return nil
+	case "config", "conf", "cfg", "settings":
+		runConfig(args)
 		return nil
 	default:
 		return fmt.Errorf("unknown command: %s (help for list)", cmd)
