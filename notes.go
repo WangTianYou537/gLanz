@@ -11,7 +11,10 @@ import (
 //
 //	{"v":1,"kind":"raw","name":"a.txt","as":"a.txt","size":12}
 //	{"v":1,"kind":"convert","name":"a.dex","as":"a.dex.zip","mode":"zip","suffix":"zip","size":20}
-//	{"v":1,"kind":"part","id":"...","name":"big.bin","as":"big_part001.zip","index":1,"total":3,"size":1048576}
+//	{"v":1,"kind":"part","id":"G1","name":"big.bin","as":"big_part001.zip","index":1,"total":3,"size":1048576,"next":"FILEID2"}
+//
+// For split files, each part's "next" is the remote file id of the following part
+// (empty/absent on the last part). Clients may walk head → next → next.
 type FileNote struct {
 	V      int    `json:"v"`
 	Kind   string `json:"kind"` // raw | convert | part
@@ -23,6 +26,7 @@ type FileNote struct {
 	Index  int    `json:"index,omitempty"`
 	Total  int    `json:"total,omitempty"`
 	Size   int64  `json:"size,omitempty"`
+	Next   string `json:"next,omitempty"` // next part file id (kind=part)
 }
 
 // Note schema version.
@@ -51,11 +55,12 @@ func FormatConvertNote(origName, uploadName, mode, suffix string, size int64) st
 }
 
 // FormatPartNote builds a JSON part note.
-func FormatPartNote(groupID, origName, uploadName string, index, total int, size int64) string {
+// nextFileID is the remote file id of the next part (empty for last).
+func FormatPartNote(groupID, origName, uploadName string, index, total int, size int64, nextFileID string) string {
 	b, _ := json.Marshal(FileNote{
 		V: NoteVersion, Kind: "part",
 		ID: groupID, Name: origName, As: uploadName,
-		Index: index, Total: total, Size: size,
+		Index: index, Total: total, Size: size, Next: nextFileID,
 	})
 	return string(b)
 }
@@ -68,6 +73,7 @@ type PartMeta struct {
 	Index   int
 	Total   int
 	Size    int64
+	Next    string // next part file id
 }
 
 // ConvertMeta is parsed from a convert (or raw) note.
@@ -133,7 +139,10 @@ func ParsePartNote(desc string) (PartMeta, bool) {
 	if n.ID == "" || n.Total < 1 || n.Index < 1 {
 		return PartMeta{}, false
 	}
-	return PartMeta{GroupID: n.ID, Name: n.Name, As: n.As, Index: n.Index, Total: n.Total, Size: n.Size}, true
+	return PartMeta{
+		GroupID: n.ID, Name: n.Name, As: n.As,
+		Index: n.Index, Total: n.Total, Size: n.Size, Next: n.Next,
+	}, true
 }
 
 // ParseConvertNote extracts ConvertMeta from convert or raw notes.
@@ -184,7 +193,11 @@ func FormatNoteDebug(desc string) string {
 	case "convert":
 		return fmt.Sprintf("convert name=%s as=%s", n.Name, n.As)
 	case "part":
-		return fmt.Sprintf("part name=%s %d/%d id=%s", n.Name, n.Index, n.Total, n.ID)
+		s := fmt.Sprintf("part name=%s %d/%d id=%s", n.Name, n.Index, n.Total, n.ID)
+		if n.Next != "" {
+			s += " next=" + n.Next
+		}
+		return s
 	default:
 		return n.Kind
 	}

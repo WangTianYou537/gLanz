@@ -863,6 +863,7 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 }
 
 // uploadSplit splits localPath into chunks, converts each, uploads, writes notes.
+// Notes form a linked list via "next" (file id of the following part).
 func (a *Account) uploadSplit(
 	localPath, origName, folderID string,
 	cfg Config, chunkBytes int64, parentCleanup func(),
@@ -879,39 +880,36 @@ func (a *Account) uploadSplit(
 	if suffix == "" {
 		suffix = "zip"
 	}
-	// Part names always use a whitelist suffix so each chunk is uploadable.
-	// Raw binary chunks have no ext → always convert.
-	parts := make([]UploadPart, 0, total)
-	var first *UploadResult
+
+	// Phase 1: upload all parts (notes written in phase 2 once next ids known).
+	type staged struct {
+		fileID string
+		name   string
+		size   int64
+		index  int
+	}
+	stagedParts := make([]staged, 0, total)
 
 	for i, p := range paths {
 		index := i + 1
 		partName := FormatSplitName(cfg.SplitNameFormat, origName, index, total, suffix)
-		// Ensure partName ends with allowed ext
 		if !IsUploadAllowedExt(fileExt(partName)) {
 			partName = partName + "." + suffix
 		}
 
 		var upPath, upName string
 		var partCleanup func()
-		// For archive suffixes under zip mode, wrap chunk in a real zip so the
-		// server accepts the extension. Otherwise rename-only.
 		needRealZip := cfg.SuffixMode == "zip" && isArchiveSuffix(suffix)
 		if needRealZip {
-			// zip content entry uses a stable inner name
 			zp, zn, err := zipSingleFile(p, suffix)
 			if err != nil {
 				return nil, err
 			}
-			// Override remote name with template (stem may differ)
 			upPath = zp
 			upName = partName
 			if fileExt(upName) != suffix {
 				upName = strings.TrimSuffix(upName, filepath.Ext(upName)) + "." + suffix
 			}
-			// zipSingleFile names as base(p)+"."+suffix; we want template name
-			// Re-zip with desired outer name by just using partName as multipart name
-			// while file on disk is real zip bytes — OK.
 			_ = zn
 			partCleanup = func() { _ = os.Remove(zp) }
 		} else {
@@ -926,7 +924,6 @@ func (a *Account) uploadSplit(
 			upPath = cp
 			partCleanup = func() { _ = os.Remove(cp) }
 		}
-		// Enforce per-request size
 		ust, err := os.Stat(upPath)
 		if err != nil {
 			partCleanup()
@@ -941,31 +938,41 @@ func (a *Account) uploadSplit(
 		if err != nil {
 			return nil, fmt.Errorf("upload part %d/%d: %w", index, total, err)
 		}
-		// Always write part JSON note.
-		if res.FileID != "" {
-			note := FormatPartNote(groupID, origName, upName, index, total, sizes[i])
-			if _, nerr := a.SetFileDescribe(res.FileID, note); nerr != nil {
-				fmt.Fprintf(os.Stderr, "[warn] set part note %d: %v\n", index, nerr)
+		stagedParts = append(stagedParts, staged{
+			fileID: res.FileID,
+			name:   res.Name,
+			size:   sizes[i],
+			index:  index,
+		})
+	}
+
+	// Phase 2: write part notes with next → following file id.
+	parts := make([]UploadPart, 0, total)
+	for i, sp := range stagedParts {
+		nextID := ""
+		if i+1 < len(stagedParts) {
+			nextID = stagedParts[i+1].fileID
+		}
+		if sp.fileID != "" {
+			note := FormatPartNote(groupID, origName, sp.name, sp.index, total, sp.size, nextID)
+			if _, nerr := a.SetFileDescribe(sp.fileID, note); nerr != nil {
+				fmt.Fprintf(os.Stderr, "[warn] set part note %d: %v\n", sp.index, nerr)
 			}
 		}
 		parts = append(parts, UploadPart{
-			FileID: res.FileID,
-			Name:   res.Name,
-			Index:  index,
+			FileID: sp.fileID,
+			Name:   sp.name,
+			Index:  sp.index,
 			Total:  total,
-			Size:   sizes[i],
+			Size:   sp.size,
 		})
-		if first == nil {
-			first = res
-		}
 	}
-	if first == nil {
+	if len(parts) == 0 {
 		return nil, fmt.Errorf("split upload produced no parts")
 	}
 	return &UploadResult{
-		FileID:   first.FileID,
-		Name:     first.Name,
-		RawJSON:  first.RawJSON,
+		FileID:   parts[0].FileID,
+		Name:     parts[0].Name,
 		FolderID: folderID,
 		Parts:    parts,
 		OrigName: origName,

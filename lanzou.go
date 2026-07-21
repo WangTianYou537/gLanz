@@ -644,6 +644,7 @@ func (c *Client) resolveViaAjax(cdnURL, riskHTML string) (string, error) {
 }
 
 // Download saves url into destDir and returns the path.
+// Progress is printed to stderr when Content-Length is known.
 func (c *Client) Download(rawURL, destDir, filename, referer string) (string, error) {
 	if err := os.MkdirAll(destDir, 0o755); err != nil {
 		return "", err
@@ -662,7 +663,7 @@ func (c *Client) Download(rawURL, destDir, filename, referer string) (string, er
 	req.Header.Set("Referer", referer)
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-	c.http.Timeout = 120 * time.Second
+	c.http.Timeout = 120 * time.Minute
 	resp, err := c.do(req)
 	if err != nil {
 		return "", err
@@ -703,10 +704,70 @@ func (c *Client) Download(rawURL, destDir, filename, referer string) (string, er
 		return "", err
 	}
 	defer f.Close()
-	if _, err := io.Copy(f, resp.Body); err != nil {
+
+	total := resp.ContentLength
+	src := io.Reader(resp.Body)
+	if total > 0 {
+		src = &progressReader{
+			r:     resp.Body,
+			total: total,
+			label: name,
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "\r[download] %s  ...", name)
+	}
+	if _, err := io.Copy(f, src); err != nil {
 		return "", err
 	}
+	if total > 0 {
+		fmt.Fprintf(os.Stderr, "\r[download] %s  100.0%%  %s/%s          \n",
+			name, humanBytes(total), humanBytes(total))
+	} else {
+		fmt.Fprintf(os.Stderr, "\r[download] %s  done                    \n", name)
+	}
 	return out, nil
+}
+
+// progressReader prints download progress to stderr.
+type progressReader struct {
+	r       io.Reader
+	total   int64
+	read    int64
+	label   string
+	lastPct int
+	lastAt  time.Time
+}
+
+func (p *progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.read += int64(n)
+		now := time.Now()
+		pct := int(p.read * 1000 / p.total) // 0.1% units
+		if p.lastAt.IsZero() || now.Sub(p.lastAt) >= 200*time.Millisecond || pct != p.lastPct || p.read >= p.total {
+			p.lastAt = now
+			p.lastPct = pct
+			fmt.Fprintf(os.Stderr, "\r[download] %s  %5.1f%%  %s/%s  ",
+				p.label, float64(p.read)*100/float64(p.total),
+				humanBytes(p.read), humanBytes(p.total))
+		}
+	}
+	return n, err
+}
+
+func humanBytes(n int64) string {
+	if n < 1024 {
+		return fmt.Sprintf("%dB", n)
+	}
+	f := float64(n)
+	units := []string{"KB", "MB", "GB", "TB"}
+	for _, u := range units {
+		f /= 1024
+		if f < 1024 {
+			return fmt.Sprintf("%.1f%s", f, u)
+		}
+	}
+	return fmt.Sprintf("%.1fPB", f/1024)
 }
 
 func isCDNRiskPage(html string) bool {

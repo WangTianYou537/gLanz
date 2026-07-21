@@ -345,7 +345,16 @@ func printList(acc *lanzou.Account, folder string, list []lanzou.ListEntry, unes
 		fmt.Printf("  [%s] id=%-12s  %s  %s\n", kind, e.ID, e.Name, extra)
 		if e.Kind == "SPLIT" {
 			for _, p := range e.Parts {
-				fmt.Printf("           └─ id=%-12s  %s  %s\n", p.ID, p.Name, p.Size)
+				extra := p.Size
+				if note := notes[p.ID]; note != "" {
+					if pm, ok := lanzou.ParsePartNote(note); ok && pm.Next != "" {
+						if extra != "" {
+							extra += "  "
+						}
+						extra += "next=" + pm.Next
+					}
+				}
+				fmt.Printf("           └─ id=%-12s  %s  %s\n", p.ID, p.Name, extra)
 			}
 		}
 	}
