@@ -3,19 +3,18 @@ package lanzou
 import (
 	"encoding/json"
 	"fmt"
-	"strconv"
 	"strings"
 )
 
 // FileNote is the unified JSON metadata stored in Lanzou file descriptions.
+// Schema v1 only (no legacy text markers):
 //
+//	{"v":1,"kind":"raw","name":"a.txt","as":"a.txt","size":12}
 //	{"v":1,"kind":"convert","name":"a.dex","as":"a.dex.zip","mode":"zip","suffix":"zip","size":20}
-//	{"v":1,"kind":"part","id":"...","name":"big.bin","index":1,"total":3,"size":1048576}
-//
-// Legacy plain-text notes ([lanzou-convert] / [lanzou-part]) are still parsed.
+//	{"v":1,"kind":"part","id":"...","name":"big.bin","as":"big_part001.zip","index":1,"total":3,"size":1048576}
 type FileNote struct {
 	V      int    `json:"v"`
-	Kind   string `json:"kind"` // convert | part
+	Kind   string `json:"kind"` // raw | convert | part
 	Name   string `json:"name,omitempty"`
 	As     string `json:"as,omitempty"`
 	Mode   string `json:"mode,omitempty"`
@@ -26,12 +25,17 @@ type FileNote struct {
 	Size   int64  `json:"size,omitempty"`
 }
 
-// FormatPartNote builds a JSON part note.
-func FormatPartNote(groupID, origName string, index, total int, size int64) string {
+// Note schema version.
+const NoteVersion = 1
+
+// FormatRawNote builds a JSON note for an upload that did not convert the suffix.
+func FormatRawNote(origName, uploadName string, size int64) string {
+	if uploadName == "" {
+		uploadName = origName
+	}
 	b, _ := json.Marshal(FileNote{
-		V: 1, Kind: "part",
-		ID: groupID, Name: origName,
-		Index: index, Total: total, Size: size,
+		V: NoteVersion, Kind: "raw",
+		Name: origName, As: uploadName, Size: size,
 	})
 	return string(b)
 }
@@ -39,64 +43,70 @@ func FormatPartNote(groupID, origName string, index, total int, size int64) stri
 // FormatConvertNote builds a JSON convert note.
 func FormatConvertNote(origName, uploadName, mode, suffix string, size int64) string {
 	b, _ := json.Marshal(FileNote{
-		V: 1, Kind: "convert",
+		V: NoteVersion, Kind: "convert",
 		Name: origName, As: uploadName,
 		Mode: mode, Suffix: suffix, Size: size,
 	})
 	return string(b)
 }
 
-// PartMeta is parsed from a file description.
+// FormatPartNote builds a JSON part note.
+func FormatPartNote(groupID, origName, uploadName string, index, total int, size int64) string {
+	b, _ := json.Marshal(FileNote{
+		V: NoteVersion, Kind: "part",
+		ID: groupID, Name: origName, As: uploadName,
+		Index: index, Total: total, Size: size,
+	})
+	return string(b)
+}
+
+// PartMeta is parsed from a part note.
 type PartMeta struct {
 	GroupID string
 	Name    string
+	As      string
 	Index   int
 	Total   int
 	Size    int64
 }
 
-// ConvertMeta is parsed from a convert description.
+// ConvertMeta is parsed from a convert (or raw) note.
 type ConvertMeta struct {
 	Name   string // original basename
 	As     string // uploaded basename
-	Mode   string // zip | rename
+	Mode   string // zip | rename (convert only)
 	Suffix string
 	Size   int64
+	Raw    bool // true when kind=raw
 }
 
-// ParseFileNote tries JSON first, then legacy text markers.
+// ParseFileNote parses a v1 JSON note only (after HTML unescape).
 func ParseFileNote(desc string) (FileNote, bool) {
 	desc = htmlUnescape(strings.TrimSpace(desc))
 	if desc == "" {
 		return FileNote{}, false
 	}
-	// JSON object (possibly with surrounding noise)
-	if i := strings.Index(desc, "{"); i >= 0 {
-		if j := strings.LastIndex(desc, "}"); j > i {
-			var n FileNote
-			if err := json.Unmarshal([]byte(desc[i:j+1]), &n); err == nil && n.Kind != "" {
-				if n.V == 0 {
-					n.V = 1
-				}
-				return n, true
-			}
-		}
+	i := strings.Index(desc, "{")
+	if i < 0 {
+		return FileNote{}, false
 	}
-	// legacy convert
-	if cm, ok := parseLegacyConvert(desc); ok {
-		return FileNote{
-			V: 1, Kind: "convert",
-			Name: cm.Name, As: cm.As, Mode: cm.Mode, Suffix: cm.Suffix, Size: cm.Size,
-		}, true
+	j := strings.LastIndex(desc, "}")
+	if j <= i {
+		return FileNote{}, false
 	}
-	// legacy part
-	if pm, ok := parseLegacyPart(desc); ok {
-		return FileNote{
-			V: 1, Kind: "part",
-			ID: pm.GroupID, Name: pm.Name, Index: pm.Index, Total: pm.Total, Size: pm.Size,
-		}, true
+	var n FileNote
+	if err := json.Unmarshal([]byte(desc[i:j+1]), &n); err != nil || n.Kind == "" {
+		return FileNote{}, false
 	}
-	return FileNote{}, false
+	switch n.Kind {
+	case "raw", "convert", "part":
+	default:
+		return FileNote{}, false
+	}
+	if n.V == 0 {
+		n.V = NoteVersion
+	}
+	return n, true
 }
 
 // htmlUnescape decodes common entities Lanzou injects into descriptions.
@@ -104,18 +114,6 @@ func htmlUnescape(s string) string {
 	if !strings.Contains(s, "&") {
 		return s
 	}
-	r := strings.NewReplacer(
-		"&quot;", `"`,
-		"&#34;", `"`,
-		"&apos;", `'`,
-		"&#39;", `'`,
-		"&lt;", "<",
-		"&gt;", ">",
-		"&amp;", "&",
-	)
-	// amp last would break others if done first; NewReplacer applies left-to-right
-	// so put amp last... actually we put amp last in list but Replacer is simultaneous
-	// on non-overlapping. Safer multi-pass for amp after quotes.
 	s = strings.ReplaceAll(s, "&quot;", `"`)
 	s = strings.ReplaceAll(s, "&#34;", `"`)
 	s = strings.ReplaceAll(s, "&apos;", `'`)
@@ -123,11 +121,10 @@ func htmlUnescape(s string) string {
 	s = strings.ReplaceAll(s, "&lt;", "<")
 	s = strings.ReplaceAll(s, "&gt;", ">")
 	s = strings.ReplaceAll(s, "&amp;", "&")
-	_ = r
 	return s
 }
 
-// ParsePartNote extracts PartMeta (JSON or legacy).
+// ParsePartNote extracts PartMeta from a JSON part note.
 func ParsePartNote(desc string) (PartMeta, bool) {
 	n, ok := ParseFileNote(desc)
 	if !ok || n.Kind != "part" {
@@ -136,92 +133,37 @@ func ParsePartNote(desc string) (PartMeta, bool) {
 	if n.ID == "" || n.Total < 1 || n.Index < 1 {
 		return PartMeta{}, false
 	}
-	return PartMeta{GroupID: n.ID, Name: n.Name, Index: n.Index, Total: n.Total, Size: n.Size}, true
+	return PartMeta{GroupID: n.ID, Name: n.Name, As: n.As, Index: n.Index, Total: n.Total, Size: n.Size}, true
 }
 
-// ParseConvertNote extracts ConvertMeta (JSON or legacy).
+// ParseConvertNote extracts ConvertMeta from convert or raw notes.
+// raw is treated as a convert-with-same-name for resolution/display.
 func ParseConvertNote(desc string) (ConvertMeta, bool) {
 	n, ok := ParseFileNote(desc)
-	if !ok || n.Kind != "convert" {
+	if !ok {
 		return ConvertMeta{}, false
 	}
-	if n.Name == "" {
+	switch n.Kind {
+	case "convert":
+		if n.Name == "" {
+			return ConvertMeta{}, false
+		}
+		return ConvertMeta{Name: n.Name, As: n.As, Mode: n.Mode, Suffix: n.Suffix, Size: n.Size}, true
+	case "raw":
+		if n.Name == "" {
+			return ConvertMeta{}, false
+		}
+		as := n.As
+		if as == "" {
+			as = n.Name
+		}
+		return ConvertMeta{Name: n.Name, As: as, Size: n.Size, Raw: true}, true
+	default:
 		return ConvertMeta{}, false
 	}
-	return ConvertMeta{Name: n.Name, As: n.As, Mode: n.Mode, Suffix: n.Suffix, Size: n.Size}, true
 }
 
-func parseLegacyPart(desc string) (PartMeta, bool) {
-	const mark = "[lanzou-part]"
-	i := strings.Index(desc, mark)
-	if i < 0 {
-		return PartMeta{}, false
-	}
-	rest := strings.TrimSpace(desc[i+len(mark):])
-	if j := strings.IndexAny(rest, "\r\n"); j >= 0 {
-		rest = rest[:j]
-	}
-	m := PartMeta{}
-	for _, field := range strings.Fields(rest) {
-		k, v, ok := strings.Cut(field, "=")
-		if !ok {
-			continue
-		}
-		switch k {
-		case "id":
-			m.GroupID = v
-		case "name":
-			m.Name = v
-		case "index":
-			m.Index, _ = strconv.Atoi(v)
-		case "total":
-			m.Total, _ = strconv.Atoi(v)
-		case "size":
-			m.Size, _ = strconv.ParseInt(v, 10, 64)
-		}
-	}
-	if m.GroupID == "" || m.Total < 1 || m.Index < 1 {
-		return PartMeta{}, false
-	}
-	return m, true
-}
-
-func parseLegacyConvert(desc string) (ConvertMeta, bool) {
-	const mark = "[lanzou-convert]"
-	i := strings.Index(desc, mark)
-	if i < 0 {
-		return ConvertMeta{}, false
-	}
-	rest := strings.TrimSpace(desc[i+len(mark):])
-	if j := strings.IndexAny(rest, "\r\n"); j >= 0 {
-		rest = rest[:j]
-	}
-	m := ConvertMeta{}
-	for _, field := range strings.Fields(rest) {
-		k, v, ok := strings.Cut(field, "=")
-		if !ok {
-			continue
-		}
-		switch k {
-		case "name":
-			m.Name = v
-		case "as":
-			m.As = v
-		case "mode":
-			m.Mode = v
-		case "suffix":
-			m.Suffix = v
-		case "size":
-			m.Size, _ = strconv.ParseInt(v, 10, 64)
-		}
-	}
-	if m.Name == "" {
-		return ConvertMeta{}, false
-	}
-	return m, true
-}
-
-// NoteKind returns "convert", "part", or "".
+// NoteKind returns "raw", "convert", "part", or "".
 func NoteKind(desc string) string {
 	n, ok := ParseFileNote(desc)
 	if !ok {
@@ -237,6 +179,8 @@ func FormatNoteDebug(desc string) string {
 		return ""
 	}
 	switch n.Kind {
+	case "raw":
+		return fmt.Sprintf("raw name=%s", n.Name)
 	case "convert":
 		return fmt.Sprintf("convert name=%s as=%s", n.Name, n.As)
 	case "part":

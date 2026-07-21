@@ -843,15 +843,17 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 			return nil, err
 		}
 		res.OrigName = origName
-		// Record original name when suffix was converted (upload name differs).
-		if res.FileID != "" && upName != origName {
-			size := st.Size()
-			if ust, e := os.Stat(localPath); e == nil {
-				size = ust.Size()
+		// Always write JSON note (raw or convert).
+		if res.FileID != "" {
+			origSize := st.Size()
+			var note string
+			if upName != origName {
+				note = FormatConvertNote(origName, upName, cfg.SuffixMode, cfg.SuffixName, origSize)
+			} else {
+				note = FormatRawNote(origName, upName, origSize)
 			}
-			note := FormatConvertNote(origName, upName, cfg.SuffixMode, cfg.SuffixName, size)
 			if _, nerr := a.SetFileDescribe(res.FileID, note); nerr != nil {
-				fmt.Fprintf(os.Stderr, "[warn] set convert note: %v\n", nerr)
+				fmt.Fprintf(os.Stderr, "[warn] set note: %v\n", nerr)
 			}
 		}
 		return res, nil
@@ -939,10 +941,10 @@ func (a *Account) uploadSplit(
 		if err != nil {
 			return nil, fmt.Errorf("upload part %d/%d: %w", index, total, err)
 		}
-		if cfg.SplitNote && res.FileID != "" {
-			note := FormatPartNote(groupID, origName, index, total, sizes[i])
+		// Always write part JSON note.
+		if res.FileID != "" {
+			note := FormatPartNote(groupID, origName, upName, index, total, sizes[i])
 			if _, nerr := a.SetFileDescribe(res.FileID, note); nerr != nil {
-				// non-fatal
 				fmt.Fprintf(os.Stderr, "[warn] set part note %d: %v\n", index, nerr)
 			}
 		}

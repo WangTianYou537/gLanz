@@ -162,12 +162,16 @@ func applyConvertNotes(rows []DisplayEntry, notes map[string]string) []DisplayEn
 		if !ok || cm.Name == "" {
 			continue
 		}
-		// Show original name; keep uploaded name in extra.
+		// Show original name; keep uploaded name in extra when converted.
 		as := cm.As
 		if as == "" {
 			as = rows[i].Name
 		}
 		rows[i].Name = cm.Name
+		if cm.Raw {
+			// raw: name already original; no extra hint needed
+			continue
+		}
 		hint := fmt.Sprintf("as=%s mode=%s", as, cm.Mode)
 		if rows[i].Extra != "" {
 			rows[i].Extra = rows[i].Extra + "  " + hint
