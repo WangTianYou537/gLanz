@@ -923,11 +923,16 @@ func (p *progressReader) Read(b []byte) (int, error) {
 	if n > 0 && p.total > 0 {
 		p.read += int64(n)
 		now := time.Now()
-		pct := int(p.read * 1000 / p.total) // 0.1% units
-		if p.lastAt.IsZero() || now.Sub(p.lastAt) >= 200*time.Millisecond || pct != p.lastPct || p.read >= p.total {
+		// whole-percent units to keep \r overwrite sparse
+		pct := int(p.read * 100 / p.total)
+		if p.read >= p.total {
+			pct = 100
+		}
+		if p.lastAt.IsZero() || now.Sub(p.lastAt) >= 200*time.Millisecond || pct != p.lastPct {
 			p.lastAt = now
 			p.lastPct = pct
-			fmt.Fprintf(os.Stderr, "\r[%s] %s  %5.1f%%  %s/%s  ",
+			// \r only — no newline; pad so shorter lines fully overwrite longer ones
+			fmt.Fprintf(os.Stderr, "\r[%s] %s  %5.1f%%  %s/%s          ",
 				p.kindTag(), p.label, float64(p.read)*100/float64(p.total),
 				humanBytes(p.read), humanBytes(p.total))
 		}
@@ -937,6 +942,7 @@ func (p *progressReader) Read(b []byte) (int, error) {
 
 func (p *progressReader) finishLine() {
 	if p.total <= 0 {
+		fmt.Fprintf(os.Stderr, "\r[%s] %s  done                    \n", p.kindTag(), p.label)
 		return
 	}
 	fmt.Fprintf(os.Stderr, "\r[%s] %s  100.0%%  %s/%s          \n",

@@ -29,7 +29,9 @@ type Config struct {
 	//   {index} 1-based part index (zero-padded to 3 by default via {index:03d})
 	//   {total} total parts
 	//   {suffix} configured SuffixName
-	// Default: "{name}_part{index:03d}.{suffix}"
+	// Default: "{name}_s{index:03d}.{suffix}"
+	// Avoid "{name}_part{index}.zip" / "{name}.part{index}.zip":
+	// Lanzou CDN returns offline ERROR:102 for large files named *partNNN*.
 	// Note: names like "x.part001.zip" are rejected by Lanzou (error 7071);
 	// use underscore form instead.
 	SplitNameFormat string `json:"split_name_format"`
@@ -47,7 +49,7 @@ func DefaultConfig() Config {
 		SuffixMode:        "zip", // zip | rename
 		SplitEnable:       true,
 		SplitSizeMB:       90,
-		SplitNameFormat:   "{name}_part{index:03d}.{suffix}",
+		SplitNameFormat:   "{name}_s{index:03d}.{suffix}",
 		SplitNote:         true,
 		ListUnescape:      true,
 	}
@@ -270,7 +272,7 @@ func (c *Config) normalize() {
 		c.SplitSizeMB = 100
 	}
 	if c.SplitNameFormat == "" {
-		c.SplitNameFormat = "{name}_part{index:03d}.{suffix}"
+		c.SplitNameFormat = "{name}_s{index:03d}.{suffix}"
 	}
 }
 

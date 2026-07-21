@@ -5,9 +5,9 @@
 package lanzou
 
 import (
-	"archive/zip"
 	"encoding/json"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -60,7 +60,11 @@ func IsUploadAllowedExt(ext string) bool {
 }
 
 // zipSingleFile packs src into a temporary .zip containing one entry (basename).
-// uploadName is the remote filename (base + "." + suffixName).
+//
+// IMPORTANT: archive/zip.Writer always emits local headers with bit 3 (data
+// descriptor) and zero sizes. Lanzou CDN rejects large files built that way
+// with offline ERROR:102. We write a Store zip with full sizes/CRC in the
+// local header (same layout the official web upload / Python zipfile produce).
 func zipSingleFile(src, suffixName string) (zipPath string, uploadName string, err error) {
 	base := filepath.Base(src)
 	if suffixName == "" {
@@ -71,30 +75,7 @@ func zipSingleFile(src, suffixName string) (zipPath string, uploadName string, e
 		return "", "", err
 	}
 	zipPath = tmp.Name()
-	zw := zip.NewWriter(tmp)
-	w, err := zw.Create(base)
-	if err != nil {
-		zw.Close()
-		tmp.Close()
-		os.Remove(zipPath)
-		return "", "", err
-	}
-	f, err := os.Open(src)
-	if err != nil {
-		zw.Close()
-		tmp.Close()
-		os.Remove(zipPath)
-		return "", "", err
-	}
-	if _, err := io.Copy(w, f); err != nil {
-		f.Close()
-		zw.Close()
-		tmp.Close()
-		os.Remove(zipPath)
-		return "", "", err
-	}
-	f.Close()
-	if err := zw.Close(); err != nil {
+	if err := writeStoreZip(src, base, tmp); err != nil {
 		tmp.Close()
 		os.Remove(zipPath)
 		return "", "", err
@@ -105,6 +86,121 @@ func zipSingleFile(src, suffixName string) (zipPath string, uploadName string, e
 	}
 	uploadName = base + "." + suffixName
 	return zipPath, uploadName, nil
+}
+
+// writeStoreZip writes a single-entry ZIP using the Store method and complete
+// local-header sizes (no data descriptor bit).
+func writeStoreZip(src, entryName string, out *os.File) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	st, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	size := st.Size()
+	if size < 0 {
+		return fmt.Errorf("invalid size")
+	}
+	// CRC32 of whole file
+	h := crc32.NewIEEE()
+	if _, err := io.Copy(h, in); err != nil {
+		return err
+	}
+	crc := h.Sum32()
+	if _, err := in.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+
+	name := []byte(entryName)
+	if len(name) == 0 || len(name) > 0xffff {
+		return fmt.Errorf("invalid zip entry name")
+	}
+	// DOS time = 0 is fine for CDN.
+	var (
+		modTime uint16
+		modDate uint16
+	)
+	// Local file header (30 bytes + name)
+	// signature, ver, flag, method, time, date, crc, csize, usize, nlen, elen
+	local := make([]byte, 30)
+	// little-endian helpers
+	putU16 := func(b []byte, v uint16) { b[0] = byte(v); b[1] = byte(v >> 8) }
+	putU32 := func(b []byte, v uint32) {
+		b[0] = byte(v)
+		b[1] = byte(v >> 8)
+		b[2] = byte(v >> 16)
+		b[3] = byte(v >> 24)
+	}
+	putU32(local[0:], 0x04034b50)
+	putU16(local[4:], 20) // version needed
+	putU16(local[6:], 0)  // flags: no data descriptor
+	putU16(local[8:], 0)  // method Store
+	putU16(local[10:], modTime)
+	putU16(local[12:], modDate)
+	putU32(local[14:], crc)
+	putU32(local[18:], uint32(size))
+	putU32(local[22:], uint32(size))
+	putU16(local[26:], uint16(len(name)))
+	putU16(local[28:], 0)
+	if _, err := out.Write(local); err != nil {
+		return err
+	}
+	if _, err := out.Write(name); err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		return err
+	}
+
+	// Central directory
+	cdStart, err := out.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	cd := make([]byte, 46)
+	putU32(cd[0:], 0x02014b50)
+	putU16(cd[4:], 20)  // version made by
+	putU16(cd[6:], 20)  // version needed
+	putU16(cd[8:], 0)   // flags
+	putU16(cd[10:], 0)  // method Store
+	putU16(cd[12:], modTime)
+	putU16(cd[14:], modDate)
+	putU32(cd[16:], crc)
+	putU32(cd[20:], uint32(size))
+	putU32(cd[24:], uint32(size))
+	putU16(cd[28:], uint16(len(name)))
+	putU16(cd[30:], 0) // extra
+	putU16(cd[32:], 0) // comment
+	putU16(cd[34:], 0) // disk start
+	putU16(cd[36:], 0) // int attr
+	putU32(cd[38:], 0) // ext attr
+	putU32(cd[42:], 0) // relative offset of local header
+	if _, err := out.Write(cd); err != nil {
+		return err
+	}
+	if _, err := out.Write(name); err != nil {
+		return err
+	}
+	cdEnd, err := out.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	// End of central directory
+	eocd := make([]byte, 22)
+	putU32(eocd[0:], 0x06054b50)
+	putU16(eocd[4:], 0)
+	putU16(eocd[6:], 0)
+	putU16(eocd[8:], 1)
+	putU16(eocd[10:], 1)
+	putU32(eocd[12:], uint32(cdEnd-cdStart))
+	putU32(eocd[16:], uint32(cdStart))
+	putU16(eocd[20:], 0)
+	_, err = out.Write(eocd)
+	return err
 }
 
 // renameCopy creates a temp copy of src (no compression). Remote name is separate.

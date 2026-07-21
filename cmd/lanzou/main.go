@@ -822,12 +822,12 @@ func resolveByNotes(list []lanzou.ListEntry, notes map[string]string, target str
 		}
 	}
 
-	// 2) split notes: group by original name
+	// 2) split notes: group by group id first (same orig name may have multiple uploads).
 	type gparts struct {
 		meta  lanzou.PartMeta
 		parts []resolvedPart
 	}
-	groups := map[string]*gparts{} // key = lower(name) or group id
+	groups := map[string]*gparts{} // key = group id
 	for _, e := range list {
 		if e.Type != lanzou.EntryFile {
 			continue
@@ -840,9 +840,10 @@ func resolveByNotes(list []lanzou.ListEntry, notes map[string]string, target str
 		if !ok {
 			continue
 		}
-		key := strings.ToLower(pm.Name)
+		key := pm.GroupID
 		if key == "" {
-			key = pm.GroupID
+			// fall back: name+index only uploads without group
+			key = strings.ToLower(pm.Name) + "#" + e.ID
 		}
 		g, exists := groups[key]
 		if !exists {
@@ -863,8 +864,9 @@ func resolveByNotes(list []lanzou.ListEntry, notes map[string]string, target str
 			Size:   pm.Size,
 		})
 	}
-	if g, ok := groups[lt]; ok && len(g.parts) > 0 {
-		// also allow match by group id
+
+	// exact group id match
+	if g, ok := groups[target]; ok && len(g.parts) > 0 {
 		sort.SliceStable(g.parts, func(i, j int) bool { return g.parts[i].Index < g.parts[j].Index })
 		name := g.meta.Name
 		if name == "" {
@@ -872,16 +874,69 @@ func resolveByNotes(list []lanzou.ListEntry, notes map[string]string, target str
 		}
 		return resolvedDownload{Kind: "split", OrigName: name, Parts: g.parts}, true
 	}
-	// match group id exactly
+
+	// match by original name: prefer complete groups, then highest max file id (newest)
+	var candidates []*gparts
 	for _, g := range groups {
-		if g.meta.GroupID == target && len(g.parts) > 0 {
-			sort.SliceStable(g.parts, func(i, j int) bool { return g.parts[i].Index < g.parts[j].Index })
-			name := g.meta.Name
-			if name == "" {
-				name = target
-			}
-			return resolvedDownload{Kind: "split", OrigName: name, Parts: g.parts}, true
+		if strings.EqualFold(g.meta.Name, target) && len(g.parts) > 0 {
+			candidates = append(candidates, g)
 		}
+	}
+	if len(candidates) > 0 {
+		score := func(g *gparts) (complete int, maxID int64, nparts int) {
+			// unique indexes
+			seen := map[int]struct{}{}
+			for _, p := range g.parts {
+				seen[p.Index] = struct{}{}
+				if id, err := strconv.ParseInt(p.FileID, 10, 64); err == nil && id > maxID {
+					maxID = id
+				}
+			}
+			nparts = len(seen)
+			want := g.meta.Total
+			if want <= 0 {
+				want = nparts
+			}
+			if nparts >= want && want > 0 {
+				complete = 1
+			}
+			return
+		}
+		sort.SliceStable(candidates, func(i, j int) bool {
+			ci, mi, ni := score(candidates[i])
+			cj, mj, nj := score(candidates[j])
+			if ci != cj {
+				return ci > cj
+			}
+			if mi != mj {
+				return mi > mj
+			}
+			return ni > nj
+		})
+		g := candidates[0]
+		// dedupe by index keeping highest file id
+		best := map[int]resolvedPart{}
+		for _, p := range g.parts {
+			if cur, ok := best[p.Index]; ok {
+				a, _ := strconv.ParseInt(cur.FileID, 10, 64)
+				b, _ := strconv.ParseInt(p.FileID, 10, 64)
+				if b > a {
+					best[p.Index] = p
+				}
+			} else {
+				best[p.Index] = p
+			}
+		}
+		parts := make([]resolvedPart, 0, len(best))
+		for _, p := range best {
+			parts = append(parts, p)
+		}
+		sort.SliceStable(parts, func(i, j int) bool { return parts[i].Index < parts[j].Index })
+		name := g.meta.Name
+		if name == "" {
+			name = target
+		}
+		return resolvedDownload{Kind: "split", OrigName: name, Parts: parts}, true
 	}
 	return resolvedDownload{}, false
 }
