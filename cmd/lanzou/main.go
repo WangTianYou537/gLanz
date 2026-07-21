@@ -36,6 +36,10 @@ func main() {
 		runInteractive(stripFlag(os.Args[1:], "-i", "--interactive"))
 		return
 	}
+	if hasFlag(os.Args[1:], "-V") || hasFlag(os.Args[1:], "--version") || hasFlag(os.Args[1:], "version") {
+		fmt.Println("lanzou", lanzou.Version)
+		return
+	}
 
 	if len(os.Args) < 2 {
 		printRootHelp()
@@ -68,6 +72,8 @@ func main() {
 		runConfig(os.Args[2:])
 	case "interactive", "i", "shell":
 		runInteractive(os.Args[2:])
+	case "version":
+		fmt.Println("lanzou", lanzou.Version)
 	case "help", "-h", "--help":
 		printRootHelp()
 	default:
@@ -111,6 +117,7 @@ func printRootHelp() {
 
 Usage:
   lanzou -i                              # interactive shell
+  lanzou --version
   lanzou <share-url> [flags]             # parse share (legacy)
   lanzou parse <share-url> [flags]
   lanzou login --user U --pass P

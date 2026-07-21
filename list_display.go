@@ -39,7 +39,7 @@ func UnescapeList(list []ListEntry, noteByID map[string]string, enabled bool) []
 			e := list[i]
 			out = append(out, flatEntry(e))
 		}
-		return out
+		return applyConvertNotes(out, noteByID)
 	}
 	if noteByID == nil {
 		noteByID = map[string]string{}
@@ -90,6 +90,7 @@ func UnescapeList(list []ListEntry, noteByID map[string]string, enabled bool) []
 	for _, e := range plain {
 		out = append(out, flatEntry(e))
 	}
+	out = applyConvertNotes(out, noteByID)
 	for _, gid := range order {
 		g := groups[gid]
 		sort.SliceStable(g.parts, func(i, j int) bool {
@@ -128,6 +129,7 @@ func UnescapeList(list []ListEntry, noteByID map[string]string, enabled bool) []
 func flatEntry(e ListEntry) DisplayEntry {
 	kind := "FILE"
 	extra := e.Size
+	name := e.Name
 	if e.Type == EntryFolder {
 		kind = "DIR"
 		extra = e.Description
@@ -136,11 +138,44 @@ func flatEntry(e ListEntry) DisplayEntry {
 	return DisplayEntry{
 		Kind:  kind,
 		ID:    e.ID,
-		Name:  e.Name,
+		Name:  name,
 		Size:  e.Size,
 		Extra: extra,
 		Raw:   &ee,
 	}
+}
+
+// applyConvertNotes rewrites FILE display names using [lanzou-convert] notes.
+func applyConvertNotes(rows []DisplayEntry, notes map[string]string) []DisplayEntry {
+	if notes == nil {
+		return rows
+	}
+	for i := range rows {
+		if rows[i].Kind != "FILE" {
+			continue
+		}
+		note := notes[rows[i].ID]
+		if note == "" && rows[i].Raw != nil {
+			note = rows[i].Raw.Description
+		}
+		cm, ok := ParseConvertNote(note)
+		if !ok || cm.Name == "" {
+			continue
+		}
+		// Show original name; keep uploaded name in extra.
+		as := cm.As
+		if as == "" {
+			as = rows[i].Name
+		}
+		rows[i].Name = cm.Name
+		hint := fmt.Sprintf("as=%s mode=%s", as, cm.Mode)
+		if rows[i].Extra != "" {
+			rows[i].Extra = rows[i].Extra + "  " + hint
+		} else {
+			rows[i].Extra = hint
+		}
+	}
+	return rows
 }
 
 func firstNote(notes map[string]string, e ListEntry) string {

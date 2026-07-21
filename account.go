@@ -843,6 +843,17 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 			return nil, err
 		}
 		res.OrigName = origName
+		// Record original name when suffix was converted (upload name differs).
+		if res.FileID != "" && upName != origName {
+			size := st.Size()
+			if ust, e := os.Stat(localPath); e == nil {
+				size = ust.Size()
+			}
+			note := FormatConvertNote(origName, upName, cfg.SuffixMode, cfg.SuffixName, size)
+			if _, nerr := a.SetFileDescribe(res.FileID, note); nerr != nil {
+				fmt.Fprintf(os.Stderr, "[warn] set convert note: %v\n", nerr)
+			}
+		}
 		return res, nil
 	}
 

@@ -354,6 +354,15 @@ func FormatPartNote(groupID, origName string, index, total int, size int64) stri
 	)
 }
 
+// FormatConvertNote builds the description written when a suffix was converted.
+// Example: [lanzou-convert] name=classes2.dex as=classes2.dex.zip mode=zip suffix=zip size=20
+func FormatConvertNote(origName, uploadName, mode, suffix string, size int64) string {
+	return fmt.Sprintf(
+		"[lanzou-convert] name=%s as=%s mode=%s suffix=%s size=%d",
+		origName, uploadName, mode, suffix, size,
+	)
+}
+
 // PartMeta is parsed from a file description.
 type PartMeta struct {
 	GroupID string
@@ -361,6 +370,15 @@ type PartMeta struct {
 	Index   int
 	Total   int
 	Size    int64
+}
+
+// ConvertMeta is parsed from a convert description.
+type ConvertMeta struct {
+	Name   string // original basename
+	As     string // uploaded basename
+	Mode   string // zip | rename
+	Suffix string
+	Size   int64
 }
 
 // ParsePartNote extracts PartMeta from a description, if present.
@@ -396,6 +414,42 @@ func ParsePartNote(desc string) (PartMeta, bool) {
 	}
 	if m.GroupID == "" || m.Total < 1 || m.Index < 1 {
 		return PartMeta{}, false
+	}
+	return m, true
+}
+
+// ParseConvertNote extracts ConvertMeta from a description, if present.
+func ParseConvertNote(desc string) (ConvertMeta, bool) {
+	const mark = "[lanzou-convert]"
+	i := strings.Index(desc, mark)
+	if i < 0 {
+		return ConvertMeta{}, false
+	}
+	rest := strings.TrimSpace(desc[i+len(mark):])
+	if j := strings.IndexAny(rest, "\r\n"); j >= 0 {
+		rest = rest[:j]
+	}
+	m := ConvertMeta{}
+	for _, field := range strings.Fields(rest) {
+		k, v, ok := strings.Cut(field, "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "name":
+			m.Name = v
+		case "as":
+			m.As = v
+		case "mode":
+			m.Mode = v
+		case "suffix":
+			m.Suffix = v
+		case "size":
+			m.Size, _ = strconv.ParseInt(v, 10, 64)
+		}
+	}
+	if m.Name == "" {
+		return ConvertMeta{}, false
 	}
 	return m, true
 }
