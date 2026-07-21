@@ -523,12 +523,24 @@ func runDelete(args []string) {
 	user, pass, cookie := accountFlags(fs)
 	fileID := fs.String("file", "", "file id")
 	folderID := fs.String("folder", "", "folder id")
+	folderCtx := fs.String("in", "-1", "folder to resolve name (default root)")
 	_ = fs.Parse(args)
+	acc := openAccount(*user, *pass, *cookie, true)
+
+	// Positional: lanzou rm <id|name>  (resolve via list + notes)
+	if fs.NArg() >= 1 && *fileID == "" && *folderID == "" {
+		target := fs.Arg(0)
+		if err := deleteTarget(acc, *folderCtx, target); err != nil {
+			fmt.Fprintln(os.Stderr, "[error]", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *fileID == "" && *folderID == "" {
-		fmt.Fprintln(os.Stderr, "usage: lanzou rm --file ID | --folder ID")
+		fmt.Fprintln(os.Stderr, "usage: lanzou rm <id|name> [--in folderID]")
+		fmt.Fprintln(os.Stderr, "   or: lanzou rm --file ID | --folder ID")
 		os.Exit(1)
 	}
-	acc := openAccount(*user, *pass, *cookie, true)
 	var raw string
 	var err error
 	if *fileID != "" {
@@ -542,6 +554,83 @@ func runDelete(args []string) {
 	}
 	fmt.Println("[ok] deleted")
 	fmt.Println(raw)
+}
+
+// deleteTarget deletes a file/folder by id, remote name, or note original name.
+// Convert files delete one; split groups delete all parts.
+func deleteTarget(acc *lanzou.Account, curFolder, target string) error {
+	list, err := acc.List(curFolder)
+	if err != nil {
+		return err
+	}
+	notes := acc.FetchNotes(list)
+
+	// 1) note-based: convert or whole split group
+	if r, ok := resolveByNotes(list, notes, target); ok {
+		if r.Kind == "split" {
+			fmt.Printf("[rm] split %s  parts=%d\n", r.OrigName, len(r.Parts))
+			var failed int
+			for _, p := range r.Parts {
+				if _, err := acc.DeleteFile(p.FileID); err != nil {
+					failed++
+					fmt.Fprintf(os.Stderr, "[warn] delete part %d id=%s: %v\n", p.Index, p.FileID, err)
+				} else {
+					fmt.Printf("[ok] deleted part %d/%d id=%s %s\n", p.Index, p.Total, p.FileID, p.Name)
+				}
+			}
+			if failed > 0 {
+				return fmt.Errorf("%d/%d parts failed to delete", failed, len(r.Parts))
+			}
+			return nil
+		}
+		if _, err := acc.DeleteFile(r.FileID); err != nil {
+			return err
+		}
+		fmt.Printf("[ok] deleted %s (id=%s remote via convert note)\n", r.OrigName, r.FileID)
+		return nil
+	}
+
+	// 2) normal list resolve
+	e, ok := resolveEntry(list, target)
+	if !ok {
+		if isDigits(target) {
+			if _, err := acc.DeleteFile(target); err != nil {
+				// try as folder
+				if _, err2 := acc.DeleteFolder(target); err2 != nil {
+					return err
+				}
+				fmt.Println("[ok] deleted folder", target)
+				return nil
+			}
+			fmt.Println("[ok] deleted file", target)
+			return nil
+		}
+		return fmt.Errorf("not found in folder %s: %s", curFolder, target)
+	}
+	if e.Type == lanzou.EntryFile {
+		// if this file is part of a split, delete whole group
+		if note := notes[e.ID]; note != "" {
+			if pm, ok := lanzou.ParsePartNote(note); ok {
+				name := pm.Name
+				if name == "" {
+					name = pm.GroupID
+				}
+				if r, ok := resolveByNotes(list, notes, name); ok && r.Kind == "split" {
+					return deleteTarget(acc, curFolder, name)
+				}
+			}
+		}
+		if _, err := acc.DeleteFile(e.ID); err != nil {
+			return err
+		}
+		fmt.Printf("[ok] deleted file %s (%s)\n", e.Name, e.ID)
+		return nil
+	}
+	if _, err := acc.DeleteFolder(e.ID); err != nil {
+		return err
+	}
+	fmt.Printf("[ok] deleted folder %s (%s)\n", e.Name, e.ID)
+	return nil
 }
 
 func runInfo(args []string) {
@@ -1488,24 +1577,7 @@ func (sh *shell) cmdInfo(target string) error {
 }
 
 func (sh *shell) cmdRm(target string) error {
-	list, err := sh.acc.List(sh.folder)
-	if err != nil {
-		return err
-	}
-	e, ok := resolveEntry(list, target)
-	if !ok {
-		return fmt.Errorf("not found: %s", target)
-	}
-	if e.Type == lanzou.EntryFile {
-		_, err = sh.acc.DeleteFile(e.ID)
-	} else {
-		_, err = sh.acc.DeleteFolder(e.ID)
-	}
-	if err != nil {
-		return err
-	}
-	fmt.Println("[ok] deleted", e.Name, e.ID)
-	return nil
+	return deleteTarget(sh.acc, sh.folder, target)
 }
 
 func (sh *shell) cmdLogin(args []string) error {
