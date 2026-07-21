@@ -899,31 +899,48 @@ func (c *Client) Download(rawURL, destDir, filename, referer string) (string, er
 	return out, nil
 }
 
-// progressReader prints download progress to stderr.
+// progressReader prints transfer progress to stderr.
+// kind is a short label such as "download" or "upload".
 type progressReader struct {
 	r       io.Reader
 	total   int64
 	read    int64
 	label   string
+	kind    string
 	lastPct int
 	lastAt  time.Time
 }
 
+func (p *progressReader) kindTag() string {
+	if p.kind == "" {
+		return "download"
+	}
+	return p.kind
+}
+
 func (p *progressReader) Read(b []byte) (int, error) {
 	n, err := p.r.Read(b)
-	if n > 0 {
+	if n > 0 && p.total > 0 {
 		p.read += int64(n)
 		now := time.Now()
 		pct := int(p.read * 1000 / p.total) // 0.1% units
 		if p.lastAt.IsZero() || now.Sub(p.lastAt) >= 200*time.Millisecond || pct != p.lastPct || p.read >= p.total {
 			p.lastAt = now
 			p.lastPct = pct
-			fmt.Fprintf(os.Stderr, "\r[download] %s  %5.1f%%  %s/%s  ",
-				p.label, float64(p.read)*100/float64(p.total),
+			fmt.Fprintf(os.Stderr, "\r[%s] %s  %5.1f%%  %s/%s  ",
+				p.kindTag(), p.label, float64(p.read)*100/float64(p.total),
 				humanBytes(p.read), humanBytes(p.total))
 		}
 	}
 	return n, err
+}
+
+func (p *progressReader) finishLine() {
+	if p.total <= 0 {
+		return
+	}
+	fmt.Fprintf(os.Stderr, "\r[%s] %s  100.0%%  %s/%s          \n",
+		p.kindTag(), p.label, humanBytes(p.total), humanBytes(p.total))
 }
 
 func humanBytes(n int64) string {

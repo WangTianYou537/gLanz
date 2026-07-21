@@ -6,7 +6,6 @@ package lanzou
 
 import (
 	"archive/zip"
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -838,6 +837,13 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 			// keep cleanup for later — restructure
 			return a.uploadSplit(upPath, origName, folderID, cfg, chunkBytes, cleanup)
 		}
+		if upName != origName {
+			fmt.Fprintf(os.Stderr, "[upload] convert %s -> %s  size=%s\n",
+				origName, upName, humanBytes(ust.Size()))
+		} else {
+			fmt.Fprintf(os.Stderr, "[upload] single %s  size=%s\n",
+				upName, humanBytes(ust.Size()))
+		}
 		res, err := a.uploadOne(upPath, upName, folderID)
 		if err != nil {
 			return nil, err
@@ -869,6 +875,13 @@ func (a *Account) uploadSplit(
 	cfg Config, chunkBytes int64, parentCleanup func(),
 ) (*UploadResult, error) {
 	defer parentCleanup()
+	st, _ := os.Stat(localPath)
+	var totalSize int64
+	if st != nil {
+		totalSize = st.Size()
+	}
+	fmt.Fprintf(os.Stderr, "[upload] split %s  size=%s  chunk=%s  ...\n",
+		origName, humanBytes(totalSize), humanBytes(chunkBytes))
 	paths, sizes, cleanup, err := splitFile(localPath, chunkBytes)
 	if err != nil {
 		return nil, err
@@ -880,6 +893,7 @@ func (a *Account) uploadSplit(
 	if suffix == "" {
 		suffix = "zip"
 	}
+	fmt.Fprintf(os.Stderr, "[upload] split ready  parts=%d  group=%s\n", total, groupID)
 
 	// Phase 1: upload all parts (notes written in phase 2 once next ids known).
 	type staged struct {
@@ -933,11 +947,15 @@ func (a *Account) uploadSplit(
 			partCleanup()
 			return nil, fmt.Errorf("part %d too large after convert: %d bytes", index, ust.Size())
 		}
+		fmt.Fprintf(os.Stderr, "[upload] part %d/%d  name=%s  payload=%s  raw=%s\n",
+			index, total, upName, humanBytes(ust.Size()), humanBytes(sizes[i]))
 		res, err := a.uploadOne(upPath, upName, folderID)
 		partCleanup()
 		if err != nil {
 			return nil, fmt.Errorf("upload part %d/%d: %w", index, total, err)
 		}
+		fmt.Fprintf(os.Stderr, "[ok %d/%d] part %d id=%s name=%s\n",
+			index, total, index, res.FileID, res.Name)
 		stagedParts = append(stagedParts, staged{
 			fileID: res.FileID,
 			name:   res.Name,
@@ -947,6 +965,7 @@ func (a *Account) uploadSplit(
 	}
 
 	// Phase 2: write part notes with next → following file id.
+	fmt.Fprintf(os.Stderr, "[upload] writing part notes (%d)...\n", total)
 	parts := make([]UploadPart, 0, total)
 	for i, sp := range stagedParts {
 		nextID := ""
@@ -970,6 +989,8 @@ func (a *Account) uploadSplit(
 	if len(parts) == 0 {
 		return nil, fmt.Errorf("split upload produced no parts")
 	}
+	fmt.Fprintf(os.Stderr, "[upload] split done  parts=%d  group=%s  orig=%s\n",
+		total, groupID, origName)
 	return &UploadResult{
 		FileID:   parts[0].FileID,
 		Name:     parts[0].Name,
@@ -981,29 +1002,14 @@ func (a *Account) uploadSplit(
 }
 
 // uploadOne POSTs a single local file with the given remote filename.
+// Streams the multipart body so large files do not need a full in-memory buffer,
+// and reports byte progress for the file part.
 func (a *Account) uploadOne(localPath, filename, folderID string) (*UploadResult, error) {
-	f, err := os.Open(localPath)
+	st, err := os.Stat(localPath)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-
-	var body bytes.Buffer
-	w := multipart.NewWriter(&body)
-	_ = w.WriteField("task", "1")
-	_ = w.WriteField("folder_id", folderID)
-	part, err := w.CreateFormFile("upload_file", filename)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := io.Copy(part, f); err != nil {
-		return nil, err
-	}
-	ct := w.FormDataContentType()
-	if err := w.Close(); err != nil {
-		return nil, err
-	}
-	payload := body.Bytes()
+	fileSize := st.Size()
 
 	tryURLs := []string{a.base + "html5up.php"}
 	if u, err := url.Parse(a.base); err == nil {
@@ -1024,8 +1030,50 @@ func (a *Account) uploadOne(localPath, filename, folderID string) (*UploadResult
 	var lastErr error
 	var raw string
 	for _, upURL := range tryURLs {
-		req, err := http.NewRequest(http.MethodPost, upURL, bytes.NewReader(payload))
+		f, err := os.Open(localPath)
 		if err != nil {
+			return nil, err
+		}
+
+		pr, pw := io.Pipe()
+		w := multipart.NewWriter(pw)
+		ct := w.FormDataContentType()
+		prog := &progressReader{r: f, total: fileSize, label: filename, kind: "upload"}
+
+		go func() {
+			var copyErr error
+			defer func() {
+				_ = w.Close()
+				_ = f.Close()
+				if copyErr != nil {
+					_ = pw.CloseWithError(copyErr)
+				} else {
+					_ = pw.Close()
+				}
+			}()
+			if err := w.WriteField("task", "1"); err != nil {
+				copyErr = err
+				return
+			}
+			if err := w.WriteField("folder_id", folderID); err != nil {
+				copyErr = err
+				return
+			}
+			part, err := w.CreateFormFile("upload_file", filename)
+			if err != nil {
+				copyErr = err
+				return
+			}
+			if _, err := io.Copy(part, prog); err != nil {
+				copyErr = err
+				return
+			}
+			prog.finishLine()
+		}()
+
+		req, err := http.NewRequest(http.MethodPost, upURL, pr)
+		if err != nil {
+			_ = pw.CloseWithError(err)
 			lastErr = err
 			continue
 		}
