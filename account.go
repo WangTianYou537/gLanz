@@ -5,6 +5,7 @@
 package lanzou
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -21,7 +22,130 @@ import (
 
 const (
 	defaultAccountBase = "https://pc.woozooo.com/"
+	// Lanzou HTML5 upload limit (server-side).
+	maxUploadBytes = 100 * 1024 * 1024
 )
+
+// uploadAllowedExts is the server-side suffix whitelist for html5up.php.
+// Source: Lanzou web upload policy (cannot upload e.g. .dex directly).
+var uploadAllowedExts = map[string]struct{}{
+	"doc": {}, "docx": {}, "zip": {}, "rar": {}, "apk": {}, "txt": {}, "exe": {},
+	"7z": {}, "e": {}, "z": {}, "ct": {}, "ke": {}, "cetrainer": {}, "db": {},
+	"tar": {}, "pdf": {}, "w3x": {}, "epub": {}, "mobi": {}, "azw": {}, "azw3": {},
+	"osk": {}, "osz": {}, "xpa": {}, "cpk": {}, "lua": {}, "jar": {}, "dmg": {},
+	"ppt": {}, "pptx": {}, "xls": {}, "xlsx": {}, "mp3": {}, "ipa": {}, "iso": {},
+	"img": {}, "gho": {}, "ttf": {}, "ttc": {}, "txf": {}, "dwg": {}, "bat": {},
+	"imazingapp": {}, "dll": {}, "crx": {}, "xapk": {}, "conf": {}, "deb": {},
+	"rp": {}, "rpm": {}, "rplib": {}, "mobileconfig": {}, "appimage": {},
+	"lolgezi": {}, "flac": {}, "cad": {}, "hwt": {}, "accdb": {}, "ce": {},
+	"xmind": {}, "enc": {}, "bds": {}, "bdi": {}, "ssf": {}, "it": {},
+	"pkg": {}, "cfg": {}, "mp4": {}, "avi": {}, "png": {}, "jpeg": {}, "jpg": {},
+	"gif": {}, "webp": {}, "brushset": {},
+}
+
+// fileExt returns lower-case extension without the leading dot.
+func fileExt(name string) string {
+	ext := strings.ToLower(filepath.Ext(name))
+	return strings.TrimPrefix(ext, ".")
+}
+
+// IsUploadAllowedExt reports whether ext (with or without leading dot) is
+// accepted by Lanzou html5up.php.
+func IsUploadAllowedExt(ext string) bool {
+	ext = strings.ToLower(strings.TrimPrefix(strings.TrimSpace(ext), "."))
+	if ext == "" {
+		return false
+	}
+	_, ok := uploadAllowedExts[ext]
+	return ok
+}
+
+// zipSingleFile packs src into a temporary .zip containing one entry (basename).
+// Caller must remove the returned path when done.
+func zipSingleFile(src string) (zipPath string, zipName string, err error) {
+	base := filepath.Base(src)
+	tmp, err := os.CreateTemp("", "lanzou-up-*.zip")
+	if err != nil {
+		return "", "", err
+	}
+	zipPath = tmp.Name()
+	zw := zip.NewWriter(tmp)
+	w, err := zw.Create(base)
+	if err != nil {
+		zw.Close()
+		tmp.Close()
+		os.Remove(zipPath)
+		return "", "", err
+	}
+	f, err := os.Open(src)
+	if err != nil {
+		zw.Close()
+		tmp.Close()
+		os.Remove(zipPath)
+		return "", "", err
+	}
+	if _, err := io.Copy(w, f); err != nil {
+		f.Close()
+		zw.Close()
+		tmp.Close()
+		os.Remove(zipPath)
+		return "", "", err
+	}
+	f.Close()
+	if err := zw.Close(); err != nil {
+		tmp.Close()
+		os.Remove(zipPath)
+		return "", "", err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(zipPath)
+		return "", "", err
+	}
+	// e.g. classes2.dex -> classes2.dex.zip
+	zipName = base + ".zip"
+	return zipPath, zipName, nil
+}
+
+// prepareUploadPath validates size/ext. Unsupported suffixes are auto-zipped.
+// cleanup removes a temp zip if one was created (no-op otherwise).
+func prepareUploadPath(localPath string) (uploadPath, uploadName string, cleanup func(), err error) {
+	cleanup = func() {}
+	st, err := os.Stat(localPath)
+	if err != nil {
+		return "", "", cleanup, err
+	}
+	if st.IsDir() {
+		return "", "", cleanup, fmt.Errorf("path is a directory: %s", localPath)
+	}
+	if st.Size() > maxUploadBytes {
+		return "", "", cleanup, fmt.Errorf(
+			"file too large: %d bytes (max %d MB)", st.Size(), maxUploadBytes/(1024*1024),
+		)
+	}
+	name := filepath.Base(localPath)
+	if IsUploadAllowedExt(fileExt(name)) {
+		return localPath, name, cleanup, nil
+	}
+	// Auto wrap unsupported suffix (e.g. .dex) into .zip
+	zp, zn, err := zipSingleFile(localPath)
+	if err != nil {
+		return "", "", cleanup, fmt.Errorf("zip unsupported ext .%s: %w", fileExt(name), err)
+	}
+	// re-check zipped size
+	zst, err := os.Stat(zp)
+	if err != nil {
+		os.Remove(zp)
+		return "", "", cleanup, err
+	}
+	if zst.Size() > maxUploadBytes {
+		os.Remove(zp)
+		return "", "", cleanup, fmt.Errorf(
+			"zipped file too large: %d bytes (max %d MB)", zst.Size(), maxUploadBytes/(1024*1024),
+		)
+	}
+	cleanup = func() { _ = os.Remove(zp) }
+	return zp, zn, cleanup, nil
+}
 
 // Account is a logged-in Lanzou control-panel client.
 type Account struct {
@@ -530,23 +654,24 @@ type UploadResult struct {
 //
 //	POST https://pc.woozooo.com/html5up.php
 //	multipart: task=1, folder_id=<id>, upload_file=@file
+//
+// Server limits: max 100MB; restricted suffix whitelist. Unsupported suffixes
+// (e.g. .dex) are automatically packed into a .zip before upload.
 func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 	if folderID == "" {
 		folderID = "-1"
 	}
-	f, err := os.Open(localPath)
+	uploadPath, filename, cleanup, err := prepareUploadPath(localPath)
+	if err != nil {
+		return nil, err
+	}
+	defer cleanup()
+
+	f, err := os.Open(uploadPath)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		return nil, err
-	}
-	if st.IsDir() {
-		return nil, fmt.Errorf("path is a directory: %s", localPath)
-	}
-	filename := filepath.Base(localPath)
 
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)

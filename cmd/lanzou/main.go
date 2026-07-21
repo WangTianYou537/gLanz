@@ -317,6 +317,10 @@ func runUpload(args []string) {
 	}
 	local := fs.Arg(0)
 	acc := openAccount(*user, *pass, *cookie, true)
+	// Hint when suffix is not on server whitelist (library will auto-zip).
+	if ext := filepath.Ext(local); ext != "" && !lanzou.IsUploadAllowedExt(ext) {
+		fmt.Printf("[upload] suffix %s not allowed by server, will pack as .zip\n", strings.ToLower(ext))
+	}
 	fmt.Println("[upload]", local, "-> folder", *folder)
 	res, err := acc.Upload(local, *folder)
 	if err != nil {
