@@ -525,9 +525,11 @@ type UploadResult struct {
 	FolderID string
 }
 
-// Upload uploads a local file to folderID ("-1" = root) via fileup.php.
-// Protocol mirrors common Lanzou web clients (task=1 multipart to fileup.php).
-// See: https://github.com/zaxtyson/LanZouCloud-API
+// Upload uploads a local file to folderID ("-1" = root) via html5up.php.
+// Matches browser HTML5 upload:
+//
+//	POST https://pc.woozooo.com/html5up.php
+//	multipart: task=1, folder_id=<id>, upload_file=@file
 func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 	if folderID == "" {
 		folderID = "-1"
@@ -549,11 +551,7 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 	var body bytes.Buffer
 	w := multipart.NewWriter(&body)
 	_ = w.WriteField("task", "1")
-	_ = w.WriteField("vie", "2")
-	_ = w.WriteField("ve", "2")
-	_ = w.WriteField("id", "WU_FILE_0")
-	_ = w.WriteField("folder_id_bb_n", folderID)
-	_ = w.WriteField("name", filename)
+	_ = w.WriteField("folder_id", folderID)
 	part, err := w.CreateFormFile("upload_file", filename)
 	if err != nil {
 		return nil, err
@@ -567,14 +565,20 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 	}
 	payload := body.Bytes()
 
-	tryURLs := []string{a.base + "fileup.php"}
-	// also try pc.woozooo.com host (common web endpoint)
+	// Prefer html5up.php (current browser endpoint); keep fileup.php as fallback.
+	tryURLs := []string{
+		a.base + "html5up.php",
+		a.base + "fileup.php",
+	}
 	if u, err := url.Parse(a.base); err == nil {
-		host := u.Host
-		if host == "up.woozooo.com" {
-			tryURLs = append(tryURLs, "https://pc.woozooo.com/fileup.php")
-		} else if host == "pc.woozooo.com" {
-			tryURLs = append(tryURLs, "https://up.woozooo.com/fileup.php")
+		alt := "https://pc.woozooo.com/"
+		if u.Host == "pc.woozooo.com" {
+			alt = "https://up.woozooo.com/"
+		} else if u.Host == "up.woozooo.com" {
+			alt = "https://pc.woozooo.com/"
+		}
+		if alt != a.base {
+			tryURLs = append(tryURLs, alt+"html5up.php", alt+"fileup.php")
 		}
 	}
 
@@ -592,7 +596,7 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 		req.Header.Set("Content-Type", ct)
 		req.Header.Set("User-Agent", defaultUA)
 		req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9")
-		req.Header.Set("Referer", a.base)
+		req.Header.Set("Referer", a.base+"mydisk.php")
 		req.Header.Set("Origin", strings.TrimRight(a.base, "/"))
 		if a.cookie != "" {
 			req.Header.Set("Cookie", a.cookie)
@@ -624,13 +628,35 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 		}
 		fileID := ""
 		name := filename
-		if text, ok := js["text"].([]any); ok && len(text) > 0 {
-			if row, ok := text[0].(map[string]any); ok {
-				fileID = anyString(row["id"])
-				if n := anyString(row["name"]); n != "" {
-					name = n
-				} else if n := anyString(row["name_all"]); n != "" {
-					name = n
+		// html5up may return text as object or array
+		switch text := js["text"].(type) {
+		case []any:
+			if len(text) > 0 {
+				if row, ok := text[0].(map[string]any); ok {
+					fileID = anyString(row["id"])
+					if n := anyString(row["name"]); n != "" {
+						name = n
+					} else if n := anyString(row["name_all"]); n != "" {
+						name = n
+					}
+				}
+			}
+		case map[string]any:
+			fileID = anyString(text["id"])
+			if n := anyString(text["name"]); n != "" {
+				name = n
+			} else if n := anyString(text["name_all"]); n != "" {
+				name = n
+			}
+		}
+		// some responses put id at top-level
+		if fileID == "" {
+			fileID = anyString(js["id"])
+			if fileID == "" {
+				if info, ok := js["info"].(map[string]any); ok {
+					fileID = anyString(info["id"])
+				} else {
+					fileID = anyString(js["info"])
 				}
 			}
 		}

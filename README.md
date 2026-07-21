@@ -56,7 +56,7 @@ list, _ := acc.List("-1")
 up, _ := acc.Upload("./a.zip", "-1")
 ```
 
-Upload endpoint: `POST fileup.php` multipart (`task=1`, field `upload_file`), compatible with common Lanzou web clients.
+Upload endpoint: `POST html5up.php` multipart (`task=1`, `folder_id`, `upload_file`), matching browser HTML5 upload.
 
 ## License
 
