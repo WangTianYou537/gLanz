@@ -241,10 +241,21 @@ func runParse(args []string) {
 		return
 	}
 
-path, err := c.DownloadShareNote(shareURL, lanzou.DownloadShareOptions{
+	var acc *lanzou.Account
+	if res.NoteKind == "part" {
+		cp := defaultCookiePath()
+		if st, err := os.Stat(cp); err == nil && st.Size() > 0 {
+			a := lanzou.NewAccount("", "", lanzou.WithCookieFile(cp))
+			if a.Verification() {
+				acc = a
+			}
+		}
+	}
+	path, err := c.DownloadShareNote(shareURL, lanzou.DownloadShareOptions{
 		Password: *pwd,
 		DestDir:  *outDir,
 		Filename: *filename,
+		Account:  acc,
 	})
 	if err != nil {
 		// Fallback: plain CDN download for non-note or when note path fails
@@ -385,11 +396,15 @@ func printList(acc *lanzou.Account, folder string, list []lanzou.ListEntry, unes
 			for _, p := range e.Parts {
 				extra := p.Size
 				if note := notes[p.ID]; note != "" {
-					if pm, ok := lanzou.ParsePartNote(note); ok && pm.Next != "" {
+					if pm, ok := lanzou.ParsePartNote(note); ok && (pm.NextURL != "" || pm.NextID != "") {
 						if extra != "" {
 							extra += "  "
 						}
-						extra += "next=" + pm.Next
+						if pm.NextURL != "" {
+						extra += "nextUrl=" + pm.NextURL
+					} else if pm.NextID != "" {
+						extra += "nextId=" + pm.NextID
+					}
 					}
 				}
 				fmt.Printf("           └─ id=%-12s  %s  %s\n", p.ID, p.Name, extra)

@@ -7,16 +7,22 @@ import (
 )
 
 // FileNote is the unified JSON metadata stored in Lanzou file descriptions.
-// Schema v1 only (no legacy text markers):
 //
-//	{"v":1,"kind":"raw","name":"a.txt","as":"a.txt","size":12}
-//	{"v":1,"kind":"convert","name":"a.dex","as":"a.dex.zip","mode":"zip","suffix":"zip","size":20}
-//	{"v":1,"kind":"part","id":"G1","name":"big.bin","as":"big_s001.zip","index":1,"total":3,"size":1048576,"next":"https://.../xxx","npwd":"ab12"}
+// Schema:
 //
-// For split files, each part's "next" is the share URL of the following part
-// (empty/absent on the last part). "npwd" is that share's password when set.
-// Clients may walk head → next → next without an account cookie.
-// Schema is not compatible with pre-0.4 notes that stored file ids in "next".
+//	{"v":2,"kind":"raw","name":"a.txt","as":"a.txt","size":12}
+//	{"v":2,"kind":"convert","name":"a.dex","as":"a.dex.zip","mode":"zip","suffix":"zip","size":20}
+//	{"v":2,"kind":"part","id":"G1","name":"big.bin","as":"big_s001.zip","index":1,"total":3,"size":1048576,
+//	 "nextId":"123","nextUrl":"https://…/xxx","npwd":"ab12"}
+//
+// Part chain fields:
+//
+//	v1: "next" is the following part's remote file id (legacy).
+//	v2: "nextId" is the file id; "nextUrl" is the share URL; "npwd" is that share's password.
+//	    "next" is not written for v2.
+//
+// Clients should prefer nextUrl (+ npwd) when present; fall back to nextId via account
+// GetFileDownloadInfo; v1 "next" is treated as nextId only.
 type FileNote struct {
 	V      int    `json:"v"`
 	Kind   string `json:"kind"` // raw | convert | part
@@ -28,12 +34,18 @@ type FileNote struct {
 	Index  int    `json:"index,omitempty"`
 	Total  int    `json:"total,omitempty"`
 	Size   int64  `json:"size,omitempty"`
-	Next   string `json:"next,omitempty"`  // next part share URL (kind=part)
-	NPwd   string `json:"npwd,omitempty"`  // password for next share (kind=part)
+
+	// v1 only (kind=part): next part remote file id.
+	Next string `json:"next,omitempty"`
+
+	// v2 (kind=part):
+	NextID  string `json:"nextId,omitempty"`  // next part file id
+	NextURL string `json:"nextUrl,omitempty"` // next part share URL
+	NPwd    string `json:"npwd,omitempty"`    // password for next share
 }
 
-// Note schema version.
-const NoteVersion = 1
+// Note schema version written by this library.
+const NoteVersion = 2
 
 // FormatRawNote builds a JSON note for an upload that did not convert the suffix.
 func FormatRawNote(origName, uploadName string, size int64) string {
@@ -57,19 +69,19 @@ func FormatConvertNote(origName, uploadName, mode, suffix string, size int64) st
 	return string(b)
 }
 
-// FormatPartNote builds a JSON part note.
-// nextShareURL / nextPwd describe the following part's share link (empty on last).
-func FormatPartNote(groupID, origName, uploadName string, index, total int, size int64, nextShareURL, nextPwd string) string {
+// FormatPartNote builds a v2 JSON part note.
+// nextFileID / nextShareURL / nextPwd describe the following part (empty on last).
+func FormatPartNote(groupID, origName, uploadName string, index, total int, size int64, nextFileID, nextShareURL, nextPwd string) string {
 	b, _ := json.Marshal(FileNote{
 		V: NoteVersion, Kind: "part",
 		ID: groupID, Name: origName, As: uploadName,
 		Index: index, Total: total, Size: size,
-		Next: nextShareURL, NPwd: nextPwd,
+		NextID: nextFileID, NextURL: nextShareURL, NPwd: nextPwd,
 	})
 	return string(b)
 }
 
-// PartMeta is parsed from a part note.
+// PartMeta is parsed from a part note (v1 or v2, normalized).
 type PartMeta struct {
 	GroupID string
 	Name    string
@@ -77,8 +89,12 @@ type PartMeta struct {
 	Index   int
 	Total   int
 	Size    int64
-	Next    string // next part share URL
-	NPwd    string // password for next share
+	// NextID is the following part's remote file id (v2 nextId, or v1 next).
+	NextID string
+	// NextURL is the following part's share URL (v2 only).
+	NextURL string
+	// NPwd is the password for NextURL when set.
+	NPwd string
 }
 
 // ConvertMeta is parsed from a convert (or raw) note.
@@ -91,7 +107,7 @@ type ConvertMeta struct {
 	Raw    bool // true when kind=raw
 }
 
-// ParseFileNote parses a v1 JSON note only (after HTML cleanup).
+// ParseFileNote parses a JSON note (after HTML cleanup). Accepts v1 and v2.
 func ParseFileNote(desc string) (FileNote, bool) {
 	desc = cleanShareDesc(strings.TrimSpace(desc))
 	if desc == "" {
@@ -115,9 +131,38 @@ func ParseFileNote(desc string) (FileNote, bool) {
 		return FileNote{}, false
 	}
 	if n.V == 0 {
-		n.V = NoteVersion
+		n.V = 1
+	}
+	if n.Kind == "part" {
+		n = normalizePartNote(n)
 	}
 	return n, true
+}
+
+// normalizePartNote maps v1 next→NextID and prefers explicit v2 fields.
+func normalizePartNote(n FileNote) FileNote {
+	if n.NextID == "" && n.Next != "" && !looksLikeShareURL(n.Next) {
+		n.NextID = n.Next
+	}
+	// accidental notes that put URL in "next" without nextUrl (short-lived 0.4.0)
+	if n.NextURL == "" && looksLikeShareURL(n.Next) {
+		n.NextURL = n.Next
+	}
+	return n
+}
+
+func looksLikeShareURL(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "//") {
+		return true
+	}
+	if strings.Contains(s, ".") && strings.Contains(s, "/") {
+		return true
+	}
+	return false
 }
 
 // htmlUnescape decodes common entities Lanzou injects into descriptions.
@@ -136,13 +181,11 @@ func htmlUnescape(s string) string {
 }
 
 // cleanShareDesc strips autolink <span> etc. injected into share-page descriptions,
-// then HTML-unescapes. Needed because Lanzou wraps https://… with colored spans,
-// which otherwise splits entity sequences like &quot; and breaks JSON.
+// then HTML-unescapes.
 func cleanShareDesc(s string) string {
 	if s == "" {
 		return s
 	}
-	// remove tags
 	var b strings.Builder
 	b.Grow(len(s))
 	inTag := false
@@ -163,7 +206,7 @@ func cleanShareDesc(s string) string {
 	return htmlUnescape(strings.TrimSpace(b.String()))
 }
 
-// ParsePartNote extracts PartMeta from a JSON part note.
+// ParsePartNote extracts PartMeta from a JSON part note (v1 or v2).
 func ParsePartNote(desc string) (PartMeta, bool) {
 	n, ok := ParseFileNote(desc)
 	if !ok || n.Kind != "part" {
@@ -175,12 +218,11 @@ func ParsePartNote(desc string) (PartMeta, bool) {
 	return PartMeta{
 		GroupID: n.ID, Name: n.Name, As: n.As,
 		Index: n.Index, Total: n.Total, Size: n.Size,
-		Next: n.Next, NPwd: n.NPwd,
+		NextID: n.NextID, NextURL: n.NextURL, NPwd: n.NPwd,
 	}, true
 }
 
 // ParseConvertNote extracts ConvertMeta from convert or raw notes.
-// raw is treated as a convert-with-same-name for resolution/display.
 func ParseConvertNote(desc string) (ConvertMeta, bool) {
 	n, ok := ParseFileNote(desc)
 	if !ok {
@@ -228,11 +270,14 @@ func FormatNoteDebug(desc string) string {
 		return fmt.Sprintf("convert name=%s as=%s", n.Name, n.As)
 	case "part":
 		s := fmt.Sprintf("part name=%s %d/%d id=%s", n.Name, n.Index, n.Total, n.ID)
-		if n.Next != "" {
-			s += " next=" + n.Next
-			if n.NPwd != "" {
-				s += " npwd=" + n.NPwd
-			}
+		if n.NextID != "" {
+			s += " nextId=" + n.NextID
+		}
+		if n.NextURL != "" {
+			s += " nextUrl=" + n.NextURL
+		}
+		if n.NPwd != "" {
+			s += " npwd=" + n.NPwd
 		}
 		return s
 	default:
@@ -241,7 +286,6 @@ func FormatNoteDebug(desc string) string {
 }
 
 // ExtractShareDescription pulls the "文件描述" field from a share page HTML.
-// Lanzou often HTML-entity-encodes the JSON note (&quot;...).
 func ExtractShareDescription(html string) string {
 	if html == "" {
 		return ""
@@ -287,7 +331,7 @@ func ExtractShareDescription(html string) string {
 			}
 		}
 	}
-	for _, marker := range []string{`"kind"`, `&quot;kind&quot;`, `"v":1`, `&quot;v&quot;:1`} {
+	for _, marker := range []string{`"kind"`, `&quot;kind&quot;`, `"v":1`, `&quot;v&quot;:1`, `"v":2`, `&quot;v&quot;:2`} {
 		if k := strings.Index(html, marker); k >= 0 {
 			start := strings.LastIndex(html[:k+1], "{")
 			if start < 0 {

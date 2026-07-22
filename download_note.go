@@ -124,43 +124,99 @@ func downloadPartChain(res *Result, shareURL string, opt DownloadShareOptions) (
 		size:     res.Note.Size,
 	}}
 
-	// Walk next share URLs from notes (no account required).
-	if res.Note.Next != "" {
-		nextURL := normalizeShareURL(res.Note.Next)
-		nextPwd := res.Note.NPwd
-		seen := map[string]struct{}{shareURL: {}}
+	// Prefer nextUrl chain; fall back to nextId via Account when URL missing.
+	nextURL := normalizeShareURL(res.Note.NextURL)
+	nextPwd := res.Note.NPwd
+	nextID := res.Note.NextID
+	if nextURL == "" && looksLikeShareURL(res.Note.Next) {
+		nextURL = normalizeShareURL(res.Note.Next)
+	}
+	if nextID == "" && res.Note.Next != "" && !looksLikeShareURL(res.Note.Next) {
+		nextID = res.Note.Next
+	}
+
+	seenURL := map[string]struct{}{shareURL: {}}
+	seenID := map[string]struct{}{res.FID: {}}
+	for guard := 0; guard < 256; guard++ {
+		var share, pwd string
+		var idx int
+		var size int64
+		var followingURL, followingPwd, followingID string
+
 		if nextURL != "" {
-			seen[nextURL] = struct{}{}
-		}
-		for guard := 0; nextURL != "" && guard < 256; guard++ {
+			if _, ok := seenURL[nextURL]; ok {
+				break
+			}
+			seenURL[nextURL] = struct{}{}
 			nc := New()
 			nres, err := nc.Parse(nextURL, Options{Password: nextPwd, ResolveDirect: false})
 			if err != nil {
-				return "", fmt.Errorf("part next share: %w", err)
-			}
-			idx := len(jobs) + 1
-			var size int64
-			following, followingPwd := "", ""
-			if nres.Note != nil && nres.Note.Kind == "part" {
-				idx = nres.Note.Index
-				size = nres.Note.Size
-				following = nres.Note.Next
-				followingPwd = nres.Note.NPwd
-				if total < nres.Note.Total {
-					total = nres.Note.Total
+				if nextID == "" || opt.Account == nil {
+					return "", fmt.Errorf("part next share: %w", err)
 				}
+				nextURL = ""
+			} else {
+				share, pwd = nextURL, nextPwd
+				idx = len(jobs) + 1
+				if nres.Note != nil && nres.Note.Kind == "part" {
+					idx = nres.Note.Index
+					size = nres.Note.Size
+					followingURL = nres.Note.NextURL
+					followingPwd = nres.Note.NPwd
+					followingID = nres.Note.NextID
+					if followingURL == "" && looksLikeShareURL(nres.Note.Next) {
+						followingURL = nres.Note.Next
+					}
+					if followingID == "" && nres.Note.Next != "" && !looksLikeShareURL(nres.Note.Next) {
+						followingID = nres.Note.Next
+					}
+					if total < nres.Note.Total {
+						total = nres.Note.Total
+					}
+				}
+				jobs = append(jobs, partJob{index: idx, shareURL: share, pwd: pwd, size: size})
+				nextURL = normalizeShareURL(followingURL)
+				nextPwd = followingPwd
+				nextID = followingID
+				continue
 			}
-			jobs = append(jobs, partJob{index: idx, shareURL: nextURL, pwd: nextPwd, size: size})
-			if following == "" {
-				break
-			}
-			if _, ok := seen[following]; ok {
-				break
-			}
-			seen[following] = struct{}{}
-			nextURL = normalizeShareURL(following)
-			nextPwd = followingPwd
 		}
+
+		if nextID == "" {
+			break
+		}
+		if _, ok := seenID[nextID]; ok {
+			break
+		}
+		seenID[nextID] = struct{}{}
+		if opt.Account == nil {
+			fmt.Fprintf(os.Stderr, "[warn] part note nextId=%s needs account cookie (no nextUrl); stopping chain\n", nextID)
+			break
+		}
+		share, pwd, err := opt.Account.GetFileDownloadInfo(nextID)
+		if err != nil {
+			return "", fmt.Errorf("part next id=%s info: %w", nextID, err)
+		}
+		desc, _ := opt.Account.GetFileDescribe(nextID)
+		pm, ok := ParsePartNote(desc)
+		idx = len(jobs) + 1
+		size = 0
+		if ok {
+			idx = pm.Index
+			size = pm.Size
+			followingURL = pm.NextURL
+			followingPwd = pm.NPwd
+			followingID = pm.NextID
+			if total < pm.Total {
+				total = pm.Total
+			}
+		} else {
+			followingURL, followingPwd, followingID = "", "", ""
+		}
+		jobs = append(jobs, partJob{index: idx, shareURL: share, pwd: pwd, size: size})
+		nextURL = normalizeShareURL(followingURL)
+		nextPwd = followingPwd
+		nextID = followingID
 	}
 
 	for i := 0; i < len(jobs); i++ {

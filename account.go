@@ -965,7 +965,7 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 }
 
 // uploadSplit splits localPath into chunks, converts each, uploads, writes notes.
-// Notes form a linked list via "next" (share URL of the following part) + "npwd".
+// Notes form a v2 linked list via nextId + nextUrl (+ npwd).
 func (a *Account) uploadSplit(
 	localPath, origName, folderID string,
 	cfg Config, chunkBytes int64, parentCleanup func(),
@@ -1081,13 +1081,14 @@ func (a *Account) uploadSplit(
 	}
 	parts := make([]UploadPart, 0, total)
 	for i, sp := range stagedParts {
-		nextURL, nextPwd := "", ""
+		nextID, nextURL, nextPwd := "", "", ""
 		if i+1 < len(stagedParts) {
+			nextID = stagedParts[i+1].fileID
 			nextURL = shares[i+1].url
 			nextPwd = shares[i+1].pwd
 		}
 		if sp.fileID != "" {
-			note := FormatPartNote(groupID, origName, sp.name, sp.index, total, sp.size, nextURL, nextPwd)
+			note := FormatPartNote(groupID, origName, sp.name, sp.index, total, sp.size, nextID, nextURL, nextPwd)
 			if _, nerr := a.SetFileDescribe(sp.fileID, note); nerr != nil {
 				fmt.Fprintf(os.Stderr, "[warn] set part note %d: %v\n", sp.index, nerr)
 			}
