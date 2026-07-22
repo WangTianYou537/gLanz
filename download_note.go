@@ -125,13 +125,11 @@ func downloadPartChain(res *Result, shareURL string, opt DownloadShareOptions) (
 	}}
 
 	// Prefer nextUrl chain; fall back to nextId via Account when URL missing.
+	// v1 "next" is already normalized into NextID by ParseFileNote (never a URL).
 	nextURL := normalizeShareURL(res.Note.NextURL)
 	nextPwd := res.Note.NPwd
 	nextID := res.Note.NextID
-	if nextURL == "" && looksLikeShareURL(res.Note.Next) {
-		nextURL = normalizeShareURL(res.Note.Next)
-	}
-	if nextID == "" && res.Note.Next != "" && !looksLikeShareURL(res.Note.Next) {
+	if nextID == "" && res.Note.Next != "" {
 		nextID = res.Note.Next
 	}
 
@@ -164,10 +162,7 @@ func downloadPartChain(res *Result, shareURL string, opt DownloadShareOptions) (
 					followingURL = nres.Note.NextURL
 					followingPwd = nres.Note.NPwd
 					followingID = nres.Note.NextID
-					if followingURL == "" && looksLikeShareURL(nres.Note.Next) {
-						followingURL = nres.Note.Next
-					}
-					if followingID == "" && nres.Note.Next != "" && !looksLikeShareURL(nres.Note.Next) {
+					if followingID == "" && nres.Note.Next != "" {
 						followingID = nres.Note.Next
 					}
 					if total < nres.Note.Total {

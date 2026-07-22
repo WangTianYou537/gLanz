@@ -22,7 +22,7 @@ import (
 //	    "next" is not written for v2.
 //
 // Clients should prefer nextUrl (+ npwd) when present; fall back to nextId via account
-// GetFileDownloadInfo; v1 "next" is treated as nextId only.
+// GetFileDownloadInfo. v1 "next" is always a file id (never a URL).
 type FileNote struct {
 	V      int    `json:"v"`
 	Kind   string `json:"kind"` // raw | convert | part
@@ -139,30 +139,12 @@ func ParseFileNote(desc string) (FileNote, bool) {
 	return n, true
 }
 
-// normalizePartNote maps v1 next→NextID and prefers explicit v2 fields.
+// normalizePartNote maps v1 "next" → NextID only. Never treats "next" as a URL.
 func normalizePartNote(n FileNote) FileNote {
-	if n.NextID == "" && n.Next != "" && !looksLikeShareURL(n.Next) {
+	if n.NextID == "" && n.Next != "" {
 		n.NextID = n.Next
 	}
-	// accidental notes that put URL in "next" without nextUrl (short-lived 0.4.0)
-	if n.NextURL == "" && looksLikeShareURL(n.Next) {
-		n.NextURL = n.Next
-	}
 	return n
-}
-
-func looksLikeShareURL(s string) bool {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return false
-	}
-	if strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://") || strings.HasPrefix(s, "//") {
-		return true
-	}
-	if strings.Contains(s, ".") && strings.Contains(s, "/") {
-		return true
-	}
-	return false
 }
 
 // htmlUnescape decodes common entities Lanzou injects into descriptions.
