@@ -69,15 +69,24 @@ type Options struct {
 
 // Result of a successful Parse.
 type Result struct {
-	FID                 string
-	Filename            string
-	PasswordProtected   bool
-	CDNDomain           string
-	Telecom             string
-	Unicom              string
-	Normal              string
-	Direct              string
-	SavedPath           string
+	FID               string
+	Filename          string
+	PasswordProtected bool
+	CDNDomain         string
+	Telecom           string
+	Unicom            string
+	Normal            string
+	Direct            string
+	SavedPath         string
+
+	// Description is the share-page "文件描述" (often a JSON FileNote).
+	Description string
+	// Note is the parsed FileNote when Description is a v1 note.
+	Note *FileNote
+	// OrigName is the original basename from a convert/part/raw note.
+	OrigName string
+	// NoteKind is raw|convert|part when a note is present.
+	NoteKind string
 }
 
 // Client holds HTTP state (cookies) for a lanzou session.
@@ -511,6 +520,20 @@ func (c *Client) Parse(shareURL string, opt Options) (*Result, error) {
 		}
 	}
 
+	desc := ExtractShareDescription(html)
+	var note *FileNote
+	var origName, noteKind string
+	if n, ok := ParseFileNote(desc); ok {
+		nn := n
+		note = &nn
+		noteKind = n.Kind
+		origName = n.Name
+		// Prefer original name from note when present.
+		if origName != "" {
+			c.filename = firstNonEmpty(c.filename, n.As)
+		}
+	}
+
 	res := &Result{
 		FID:               fid,
 		Filename:          c.filename,
@@ -519,6 +542,10 @@ func (c *Client) Parse(shareURL string, opt Options) (*Result, error) {
 		Telecom:           ls.telecom,
 		Unicom:            ls.unicom,
 		Normal:            ls.normal,
+		Description:       htmlUnescape(desc),
+		Note:              note,
+		OrigName:          origName,
+		NoteKind:          noteKind,
 	}
 
 	// Default resolve direct to true for Options{} used carefully:

@@ -202,3 +202,73 @@ func FormatNoteDebug(desc string) string {
 		return n.Kind
 	}
 }
+
+// ExtractShareDescription pulls the "文件描述" field from a share page HTML.
+// Lanzou often HTML-entity-encodes the JSON note (&quot;...).
+func ExtractShareDescription(html string) string {
+	if html == "" {
+		return ""
+	}
+	const label = "文件描述"
+	if i := strings.Index(html, label); i >= 0 {
+		rest := html[i+len(label):]
+		rest = strings.TrimLeft(rest, "：: \t\r\n ")
+		for {
+			rest = strings.TrimSpace(rest)
+			if strings.HasPrefix(rest, "<") {
+				if j := strings.Index(rest, ">"); j >= 0 {
+					rest = rest[j+1:]
+					continue
+				}
+			}
+			break
+		}
+		if k := strings.Index(rest, "{"); k >= 0 {
+			depth := 0
+			for p := k; p < len(rest); p++ {
+				switch rest[p] {
+				case '{':
+					depth++
+				case '}':
+					depth--
+					if depth == 0 {
+						return strings.TrimSpace(rest[k : p+1])
+					}
+				}
+			}
+		}
+		for _, sep := range []string{"</td>", "<td", "<div"} {
+			if j := strings.Index(rest, sep); j > 0 {
+				cand := strings.TrimSpace(rest[:j])
+				cand = strings.ReplaceAll(cand, "<br>", "")
+				cand = strings.ReplaceAll(cand, "<br/>", "")
+				cand = strings.ReplaceAll(cand, "<br />", "")
+				cand = strings.TrimSpace(cand)
+				if cand != "" {
+					return cand
+				}
+			}
+		}
+	}
+	for _, marker := range []string{`"kind"`, `&quot;kind&quot;`, `"v":1`, `&quot;v&quot;:1`} {
+		if k := strings.Index(html, marker); k >= 0 {
+			start := strings.LastIndex(html[:k+1], "{")
+			if start < 0 {
+				continue
+			}
+			depth := 0
+			for p := start; p < len(html); p++ {
+				switch html[p] {
+				case '{':
+					depth++
+				case '}':
+					depth--
+					if depth == 0 {
+						return strings.TrimSpace(html[start : p+1])
+					}
+				}
+			}
+		}
+	}
+	return ""
+}

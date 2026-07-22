@@ -181,10 +181,12 @@ Account flags:
 func runParse(args []string) {
 	fs := pflag.NewFlagSet("parse", pflag.ExitOnError)
 	pwd := fs.StringP("pwd", "p", "", "share password")
-	down := fs.Bool("down", false, "download after resolve")
+	down := fs.Bool("down", false, "download after resolve (always on for convert/part notes unless --no-down)")
+	noDown := fs.Bool("no-down", false, "do not auto-download convert/part notes")
 	outDir := fs.StringP("output-dir", "o", ".", "download directory")
 	filename := fs.StringP("filename", "f", "", "save filename")
 	noResolve := fs.Bool("no-resolve", false, "skip CDN direct resolve")
+	_, _, cookie := accountFlags(fs)
 	_ = fs.Parse(args)
 
 	if fs.NArg() < 1 {
@@ -195,6 +197,7 @@ func runParse(args []string) {
 	shareURL := fs.Arg(0)
 
 	c := lanzou.New()
+	// For note-aware auto download we still want links; resolve only when not downloading notes.
 	opt := lanzou.Options{Password: *pwd, ResolveDirect: !*noResolve}
 	res, err := c.Parse(shareURL, opt)
 	if err != nil {
@@ -210,6 +213,15 @@ func runParse(args []string) {
 	fmt.Println("============================================================")
 	fmt.Println("  fid:     ", res.FID)
 	fmt.Println("  filename:", empty(res.Filename, "?"))
+	if res.OrigName != "" {
+		fmt.Println("  orig:    ", res.OrigName)
+	}
+	if res.NoteKind != "" {
+		fmt.Println("  note:    ", res.NoteKind)
+	}
+	if res.Description != "" {
+		fmt.Println("  desc:    ", truncateStr(res.Description, 200))
+	}
 	fmt.Println("  password:", yn(res.PasswordProtected))
 	fmt.Println("  cdn:     ", res.CDNDomain)
 	fmt.Println("  telecom: ", res.Telecom)
@@ -219,18 +231,56 @@ func runParse(args []string) {
 	}
 	fmt.Println("============================================================")
 
-	if *down {
-		u := res.Direct
-		if u == "" {
-			u = res.Telecom
-		}
-		path, err := c.Download(u, *outDir, first(*filename, res.Filename), "")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "[error] download:", err)
-			os.Exit(1)
-		}
-		fmt.Println("[done] saved:", path)
+	// Auto-download when share carries convert/part notes (restore original name / merge parts).
+	wantDown := *down
+	if !*noDown && (res.NoteKind == "convert" || res.NoteKind == "part") {
+		wantDown = true
 	}
+	if !wantDown {
+		return
+	}
+
+	var acc *lanzou.Account
+	if res.NoteKind == "part" {
+		// Best-effort: use saved cookie to walk next part ids.
+		if st, err := os.Stat(*cookie); err == nil && st.Size() > 0 {
+			func() {
+				defer func() { _ = recover() }()
+				acc = openAccount("", "", *cookie, false)
+			}()
+		}
+		if acc == nil {
+			fmt.Fprintln(os.Stderr, "[warn] part note needs account cookie to merge remaining parts; try lanzou login first")
+		}
+	}
+	path, err := c.DownloadShareNote(shareURL, lanzou.DownloadShareOptions{
+		Password: *pwd,
+		DestDir:  *outDir,
+		Filename: *filename,
+		Account:  acc,
+	})
+	if err != nil {
+		// Fallback: plain CDN download for non-note or when note path fails
+		if res.NoteKind == "" {
+			u := res.Direct
+			if u == "" {
+				u = res.Telecom
+			}
+			path, err = c.Download(u, *outDir, first(*filename, res.Filename), shareURL)
+		}
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "[error] download:", err)
+		os.Exit(1)
+	}
+	fmt.Println("[done] saved:", path)
+}
+
+func truncateStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func accountFlags(fs *pflag.FlagSet) (user, pass, cookie *string) {
