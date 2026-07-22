@@ -66,6 +66,10 @@ func main() {
 		runMkdir(os.Args[2:])
 	case "rm", "delete", "del", "remove", "unlink":
 		runDelete(os.Args[2:])
+	case "mv", "move":
+		runMove(os.Args[2:])
+	case "rename", "rn", "ren":
+		runRename(os.Args[2:])
 	case "info", "show", "stat":
 		runInfo(os.Args[2:])
 	case "passwd", "password", "pwdset":
@@ -132,6 +136,8 @@ Usage:
   lanzou download|dl|down|fetch <id|name> [--folder ID] [-o DIR] [-j N]
   lanzou mkdir|md <name> [--folder parentID]
   lanzou rm|delete|del|remove --file ID | --folder ID
+  lanzou mv|move <file-id|name> <dest-folder-id|name|/|-1> [--in folderID]
+  lanzou rename|rn|ren <id|name> <new-name> [--in folderID] [--note]
   lanzou info|show|stat --file ID | --folder ID
   lanzou passwd|password|pwdset --file ID --pwd XXX
   lanzou config|conf|cfg [list|get KEY|set KEY VALUE|path|reset]
@@ -159,6 +165,8 @@ Interactive (-i) commands:
   upload|up|put <local-path>
   mkdir|md <name>
   rm|delete|del|remove <id|name>
+  mv|move <file> <dest-folder|/|-1>
+  rename|rn|ren <id|name> <new-name> [--note]
   login|signin / logout|signout
   config|conf|cfg ...
   help / exit|quit|q
@@ -616,6 +624,305 @@ func runDelete(args []string) {
 	}
 	fmt.Println("[ok] deleted")
 	fmt.Println(raw)
+}
+
+func runMove(args []string) {
+	fs := pflag.NewFlagSet("mv", pflag.ExitOnError)
+	user, pass, cookie := accountFlags(fs)
+	folderCtx := fs.String("in", "-1", "folder to resolve source name (default root)")
+	_ = fs.Parse(args)
+	if fs.NArg() < 2 {
+		fmt.Fprintln(os.Stderr, "usage: lanzou mv|move <file-id|name> <dest-folder-id|name|/|-1> [--in folderID]")
+		fmt.Fprintln(os.Stderr, "  note: only files can be moved (folder move is not supported by Lanzou)")
+		os.Exit(1)
+	}
+	acc := openAccount(*user, *pass, *cookie, true)
+	if err := moveTarget(acc, *folderCtx, fs.Arg(0), fs.Arg(1)); err != nil {
+		fmt.Fprintln(os.Stderr, "[error]", err)
+		os.Exit(1)
+	}
+}
+
+func runRename(args []string) {
+	fs := pflag.NewFlagSet("rename", pflag.ExitOnError)
+	user, pass, cookie := accountFlags(fs)
+	folderCtx := fs.String("in", "-1", "folder to resolve name (default root)")
+	noteOnly := fs.Bool("note", false, "only update JSON note display name (no server rename; works without VIP)")
+	_ = fs.Parse(args)
+	if fs.NArg() < 2 {
+		fmt.Fprintln(os.Stderr, "usage: lanzou rename|rn|ren <id|name> <new-name> [--in folderID] [--note]")
+		fmt.Fprintln(os.Stderr, "  file rename requires VIP (task=46 type=2); use --note for logical name via description")
+		fmt.Fprintln(os.Stderr, "  folder rename always works (task=4)")
+		os.Exit(1)
+	}
+	acc := openAccount(*user, *pass, *cookie, true)
+	if err := renameTarget(acc, *folderCtx, fs.Arg(0), fs.Arg(1), *noteOnly); err != nil {
+		fmt.Fprintln(os.Stderr, "[error]", err)
+		os.Exit(1)
+	}
+}
+
+// moveTarget moves a file (by id/name/note) into dest folder (id/name/"/"/"-1").
+func moveTarget(acc *lanzou.Account, curFolder, src, dest string) error {
+	list, err := acc.List(curFolder)
+	if err != nil {
+		return err
+	}
+	notes := acc.FetchNotes(list)
+
+	// resolve source file(s)
+	var fileIDs []string
+	var label string
+	if r, ok := resolveByNotes(list, notes, src); ok {
+		if r.Kind == "split" {
+			for _, p := range r.Parts {
+				fileIDs = append(fileIDs, p.FileID)
+			}
+			label = r.OrigName + " (split)"
+		} else {
+			fileIDs = []string{r.FileID}
+			label = r.OrigName
+		}
+	} else if e, ok := resolveEntry(list, src); ok {
+		if e.Type == lanzou.EntryFolder {
+			return fmt.Errorf("cannot move folder %s (Lanzou has no folder-move API)", e.Name)
+		}
+		// if part of split, move whole group
+		if note := notes[e.ID]; note != "" {
+			if pm, ok := lanzou.ParsePartNote(note); ok {
+				name := pm.Name
+				if name == "" {
+					name = pm.GroupID
+				}
+				if r, ok := resolveByNotes(list, notes, name); ok && r.Kind == "split" {
+					return moveTarget(acc, curFolder, name, dest)
+				}
+			}
+		}
+		fileIDs = []string{e.ID}
+		label = e.Name
+	} else if isDigits(src) {
+		fileIDs = []string{src}
+		label = src
+	} else {
+		return fmt.Errorf("source not found in folder %s: %s", curFolder, src)
+	}
+
+	destID, err := resolveFolderID(acc, curFolder, dest)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("[mv] %s -> folder %s  files=%d\n", label, destID, len(fileIDs))
+	var failed int
+	for _, id := range fileIDs {
+		raw, err := acc.MoveFile(id, destID)
+		if err != nil {
+			failed++
+			fmt.Fprintf(os.Stderr, "[warn] move id=%s: %v\n", id, err)
+			continue
+		}
+		fmt.Printf("[ok] moved id=%s  %s\n", id, strings.TrimSpace(raw))
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d/%d moves failed", failed, len(fileIDs))
+	}
+	return nil
+}
+
+// resolveFolderID maps dest token to folder id.
+func resolveFolderID(acc *lanzou.Account, curFolder, dest string) (string, error) {
+	dest = strings.TrimSpace(dest)
+	if dest == "" || dest == "/" || dest == "root" || dest == "~" || dest == "-1" {
+		return "-1", nil
+	}
+	if isDigits(dest) || dest == "-1" {
+		return dest, nil
+	}
+	// name in current folder
+	list, err := acc.List(curFolder)
+	if err != nil {
+		return "", err
+	}
+	if e, ok := resolveEntry(list, dest); ok {
+		if e.Type != lanzou.EntryFolder {
+			return "", fmt.Errorf("destination is a file, not folder: %s", dest)
+		}
+		return e.ID, nil
+	}
+	// also try root
+	if curFolder != "-1" {
+		rootList, err := acc.List("-1")
+		if err == nil {
+			if e, ok := resolveEntry(rootList, dest); ok && e.Type == lanzou.EntryFolder {
+				return e.ID, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("destination folder not found: %s", dest)
+}
+
+// renameTarget renames a file or folder by id/name.
+// noteOnly: only rewrite JSON note "name" (logical rename, no VIP needed).
+func renameTarget(acc *lanzou.Account, curFolder, target, newName string, noteOnly bool) error {
+	newName = strings.TrimSpace(newName)
+	if newName == "" {
+		return fmt.Errorf("new name is empty")
+	}
+	list, err := acc.List(curFolder)
+	if err != nil {
+		return err
+	}
+	notes := acc.FetchNotes(list)
+
+	// Prefer explicit folder match first for folders with same display as files.
+	if e, ok := resolveEntry(list, target); ok && e.Type == lanzou.EntryFolder {
+		raw, err := acc.RenameFolder(e.ID, newName, "")
+		if err != nil {
+			return err
+		}
+		fmt.Printf("[ok] renamed folder %s -> %s  id=%s\n", e.Name, newName, e.ID)
+		fmt.Println(raw)
+		return nil
+	}
+
+	// note-based convert / split
+	if r, ok := resolveByNotes(list, notes, target); ok {
+		if r.Kind == "split" {
+			if !noteOnly {
+				// try VIP rename on each part's remote name is meaningless; update notes
+				fmt.Fprintf(os.Stderr, "[info] split group: updating note display name on all parts (logical)\n")
+			}
+			var failed int
+			for _, p := range r.Parts {
+				if _, err := acc.RenameNote(p.FileID, newName); err != nil {
+					failed++
+					fmt.Fprintf(os.Stderr, "[warn] note rename part id=%s: %v\n", p.FileID, err)
+				} else {
+					fmt.Printf("[ok] note name=%s  part id=%s\n", newName, p.FileID)
+				}
+			}
+			if failed > 0 {
+				return fmt.Errorf("%d/%d part notes failed", failed, len(r.Parts))
+			}
+			return nil
+		}
+		// convert / single
+		if noteOnly {
+			raw, err := acc.RenameNote(r.FileID, newName)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("[ok] note rename %s -> %s  id=%s\n", r.OrigName, newName, r.FileID)
+			fmt.Println(raw)
+			return nil
+		}
+		raw, err := acc.RenameFile(r.FileID, newName)
+		if err != nil {
+			// fallback to note rename when VIP required
+			if strings.Contains(err.Error(), "会员") {
+				fmt.Fprintf(os.Stderr, "[warn] server rename requires VIP (%v); falling back to --note\n", err)
+				raw2, err2 := acc.RenameNote(r.FileID, newName)
+				if err2 != nil {
+					return fmt.Errorf("rename VIP-only and note fallback failed: %v / %v", err, err2)
+				}
+				fmt.Printf("[ok] note rename %s -> %s  id=%s (VIP rename unavailable)\n", r.OrigName, newName, r.FileID)
+				fmt.Println(raw2)
+				return nil
+			}
+			return err
+		}
+		// also update note name so list_unescape stays consistent
+		if _, err2 := acc.RenameNote(r.FileID, newName); err2 != nil {
+			fmt.Fprintf(os.Stderr, "[warn] server renamed but note update failed: %v\n", err2)
+		}
+		fmt.Printf("[ok] renamed file %s -> %s  id=%s\n", r.OrigName, newName, r.FileID)
+		fmt.Println(raw)
+		return nil
+	}
+
+	if e, ok := resolveEntry(list, target); ok {
+		if e.Type == lanzou.EntryFolder {
+			raw, err := acc.RenameFolder(e.ID, newName, "")
+			if err != nil {
+				return err
+			}
+			fmt.Printf("[ok] renamed folder %s -> %s  id=%s\n", e.Name, newName, e.ID)
+			fmt.Println(raw)
+			return nil
+		}
+		// part of split?
+		if note := notes[e.ID]; note != "" {
+			if pm, ok := lanzou.ParsePartNote(note); ok {
+				name := pm.Name
+				if name == "" {
+					name = pm.GroupID
+				}
+				return renameTarget(acc, curFolder, name, newName, true)
+			}
+		}
+		if noteOnly {
+			raw, err := acc.RenameNote(e.ID, newName)
+			if err != nil {
+				// no note: create a raw note with display name
+				raw2, err2 := acc.SetFileDescribe(e.ID, lanzou.FormatRawNote(newName, e.Name, 0))
+				if err2 != nil {
+					return fmt.Errorf("note rename: %v; create raw note: %v", err, err2)
+				}
+				fmt.Printf("[ok] wrote raw note name=%s as=%s  id=%s\n", newName, e.Name, e.ID)
+				fmt.Println(raw2)
+				return nil
+			}
+			fmt.Printf("[ok] note rename %s -> %s  id=%s\n", e.Name, newName, e.ID)
+			fmt.Println(raw)
+			return nil
+		}
+		raw, err := acc.RenameFile(e.ID, newName)
+		if err != nil {
+			if strings.Contains(err.Error(), "会员") {
+				fmt.Fprintf(os.Stderr, "[warn] server rename requires VIP (%v); falling back to --note\n", err)
+				return renameTarget(acc, curFolder, target, newName, true)
+			}
+			return err
+		}
+		fmt.Printf("[ok] renamed file %s -> %s  id=%s\n", e.Name, newName, e.ID)
+		fmt.Println(raw)
+		return nil
+	}
+
+	if isDigits(target) {
+		// try as folder first
+		if info, err := acc.GetFolderInfo(target); err == nil && info.Name != "" {
+			raw, err := acc.RenameFolder(target, newName, info.Description)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("[ok] renamed folder %s -> %s  id=%s\n", info.Name, newName, target)
+			fmt.Println(raw)
+			return nil
+		}
+		if noteOnly {
+			raw, err := acc.RenameNote(target, newName)
+			if err != nil {
+				return err
+			}
+			fmt.Printf("[ok] note rename id=%s -> %s\n", target, newName)
+			fmt.Println(raw)
+			return nil
+		}
+		raw, err := acc.RenameFile(target, newName)
+		if err != nil {
+			if strings.Contains(err.Error(), "会员") {
+				fmt.Fprintf(os.Stderr, "[warn] server rename requires VIP (%v); falling back to --note\n", err)
+				return renameTarget(acc, curFolder, target, newName, true)
+			}
+			return err
+		}
+		fmt.Printf("[ok] renamed file id=%s -> %s\n", target, newName)
+		fmt.Println(raw)
+		return nil
+	}
+	return fmt.Errorf("not found in folder %s: %s", curFolder, target)
 }
 
 // deleteTarget deletes a file/folder by id, remote name, or note original name.
@@ -1455,6 +1762,7 @@ func (sh *shell) exec(line string) error {
 		fmt.Println("download|dl|down|fetch <id|name> [-j N] [-o DIR]")
 		fmt.Println("info|show|stat <id|name> | upload|up|put <path>")
 		fmt.Println("mkdir|md <name> | rm|delete|del|remove <id|name>")
+		fmt.Println("mv|move <file> <dest-folder|/|-1> | rename|rn|ren <id|name> <new-name> [--note]")
 		fmt.Println("login|signin [--user U --pass P] | logout|signout")
 		fmt.Println("config|conf|cfg [list|get|set ...] | exit|quit|q")
 		return nil
@@ -1507,6 +1815,29 @@ func (sh *shell) exec(line string) error {
 			return fmt.Errorf("usage: rm <id|name>")
 		}
 		return sh.cmdRm(args[0])
+	case "mv", "move":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: mv|move <file> <dest-folder|/|-1>")
+		}
+		return moveTarget(sh.acc, sh.folderID(), args[0], args[1])
+	case "rename", "rn", "ren":
+		if len(args) < 2 {
+			return fmt.Errorf("usage: rename|rn|ren <id|name> <new-name> [--note]")
+		}
+		noteOnly := false
+		newName := args[1]
+		for _, a := range args[1:] {
+			if a == "--note" {
+				noteOnly = true
+			}
+		}
+		for i := len(args) - 1; i >= 1; i-- {
+			if args[i] != "--note" {
+				newName = args[i]
+				break
+			}
+		}
+		return renameTarget(sh.acc, sh.folderID(), args[0], newName, noteOnly)
 	case "login", "signin", "auth":
 		return sh.cmdLogin(args)
 	case "logout", "signout":

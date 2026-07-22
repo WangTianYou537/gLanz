@@ -833,13 +833,130 @@ func (a *Account) SetFileDescribe(fileID, describe string) (string, error) {
 	return a.postTask(form.Encode())
 }
 
-// MoveFile moves a file into folderID.
+// MoveFile moves a file into folderID ("-1" = root).
 func (a *Account) MoveFile(fileID, folderID string) (string, error) {
+	if folderID == "" {
+		folderID = "-1"
+	}
 	form := url.Values{}
 	form.Set("task", "20")
 	form.Set("folder_id", folderID)
 	form.Set("file_id", fileID)
 	return a.postTask(form.Encode())
+}
+
+// GetFileNameStem fetches the editable file-name stem (task=46 type=1).
+// Official UI uses this before RenameFile; info is the stem without extension.
+func (a *Account) GetFileNameStem(fileID string) (string, error) {
+	form := url.Values{}
+	form.Set("task", "46")
+	form.Set("file_id", fileID)
+	form.Set("type", "1")
+	raw, err := a.postTask(form.Encode())
+	if err != nil {
+		return "", err
+	}
+	var js map[string]any
+	if err := json.Unmarshal([]byte(raw), &js); err != nil {
+		return "", fmt.Errorf("rename stem json: %w; body=%s", err, truncate(raw, 120))
+	}
+	if anyString(js["zt"]) != "1" {
+		info := anyString(js["info"])
+		if info == "" {
+			info = raw
+		}
+		return "", fmt.Errorf("rename stem failed: %s", info)
+	}
+	return anyString(js["info"]), nil
+}
+
+// RenameFile renames a file via task=46 type=2.
+// Official site restricts this to VIP accounts ("此功能仅会员使用").
+// newName may be a stem or a full filename; extension is taken from newName when present,
+// otherwise the remote extension is kept by the server when stem-only is supplied.
+func (a *Account) RenameFile(fileID, newName string) (string, error) {
+	newName = strings.TrimSpace(newName)
+	if fileID == "" || newName == "" {
+		return "", fmt.Errorf("file id and new name required")
+	}
+	// Prefer stem (matches official UI). If caller passed "foo.txt", use "foo".
+	stem := newName
+	if i := strings.LastIndex(newName, "."); i > 0 && i < len(newName)-1 {
+		// only strip a short alphanumeric extension
+		ext := newName[i+1:]
+		if len(ext) <= 8 && isSimpleExt(ext) {
+			stem = newName[:i]
+		}
+	}
+	form := url.Values{}
+	form.Set("task", "46")
+	form.Set("file_id", fileID)
+	form.Set("file_name", stem)
+	form.Set("type", "2")
+	raw, err := a.postTask(form.Encode())
+	if err != nil {
+		return "", err
+	}
+	var js map[string]any
+	if err := json.Unmarshal([]byte(raw), &js); err != nil {
+		return raw, fmt.Errorf("rename json: %w; body=%s", err, truncate(raw, 120))
+	}
+	if anyString(js["zt"]) != "1" {
+		info := anyString(js["info"])
+		if info == "" {
+			info = raw
+		}
+		return raw, fmt.Errorf("%s", info)
+	}
+	return raw, nil
+}
+
+func isSimpleExt(ext string) bool {
+	for _, r := range ext {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// RenameFolder renames a folder (task=4). Empty describe keeps the existing description.
+func (a *Account) RenameFolder(folderID, newName, describe string) (string, error) {
+	newName = strings.TrimSpace(newName)
+	if folderID == "" || newName == "" {
+		return "", fmt.Errorf("folder id and new name required")
+	}
+	if describe == "" {
+		if info, err := a.GetFolderInfo(folderID); err == nil {
+			describe = info.Description
+		}
+	}
+	return a.SetFolderNameAndDescribe(folderID, newName, describe)
+}
+
+// RenameNote updates the display "name" inside a convert/raw/part JSON note (logical rename).
+// Remote upload filename is unchanged. Useful when VIP file rename is unavailable.
+func (a *Account) RenameNote(fileID, newName string) (string, error) {
+	newName = strings.TrimSpace(newName)
+	if fileID == "" || newName == "" {
+		return "", fmt.Errorf("file id and new name required")
+	}
+	desc, err := a.GetFileDescribe(fileID)
+	if err != nil {
+		return "", err
+	}
+	n, ok := ParseFileNote(desc)
+	if !ok {
+		return "", fmt.Errorf("no JSON note on file %s (cannot logical-rename)", fileID)
+	}
+	n.Name = newName
+	// Keep as_name if empty for raw
+	b, err := json.Marshal(n)
+	if err != nil {
+		return "", err
+	}
+	return a.SetFileDescribe(fileID, string(b))
 }
 
 // DeleteFile deletes a file by id.
