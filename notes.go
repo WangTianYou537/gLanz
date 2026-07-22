@@ -11,10 +11,12 @@ import (
 //
 //	{"v":1,"kind":"raw","name":"a.txt","as":"a.txt","size":12}
 //	{"v":1,"kind":"convert","name":"a.dex","as":"a.dex.zip","mode":"zip","suffix":"zip","size":20}
-//	{"v":1,"kind":"part","id":"G1","name":"big.bin","as":"big_part001.zip","index":1,"total":3,"size":1048576,"next":"FILEID2"}
+//	{"v":1,"kind":"part","id":"G1","name":"big.bin","as":"big_s001.zip","index":1,"total":3,"size":1048576,"next":"https://.../xxx","npwd":"ab12"}
 //
-// For split files, each part's "next" is the remote file id of the following part
-// (empty/absent on the last part). Clients may walk head → next → next.
+// For split files, each part's "next" is the share URL of the following part
+// (empty/absent on the last part). "npwd" is that share's password when set.
+// Clients may walk head → next → next without an account cookie.
+// Schema is not compatible with pre-0.4 notes that stored file ids in "next".
 type FileNote struct {
 	V      int    `json:"v"`
 	Kind   string `json:"kind"` // raw | convert | part
@@ -26,7 +28,8 @@ type FileNote struct {
 	Index  int    `json:"index,omitempty"`
 	Total  int    `json:"total,omitempty"`
 	Size   int64  `json:"size,omitempty"`
-	Next   string `json:"next,omitempty"` // next part file id (kind=part)
+	Next   string `json:"next,omitempty"`  // next part share URL (kind=part)
+	NPwd   string `json:"npwd,omitempty"`  // password for next share (kind=part)
 }
 
 // Note schema version.
@@ -55,12 +58,13 @@ func FormatConvertNote(origName, uploadName, mode, suffix string, size int64) st
 }
 
 // FormatPartNote builds a JSON part note.
-// nextFileID is the remote file id of the next part (empty for last).
-func FormatPartNote(groupID, origName, uploadName string, index, total int, size int64, nextFileID string) string {
+// nextShareURL / nextPwd describe the following part's share link (empty on last).
+func FormatPartNote(groupID, origName, uploadName string, index, total int, size int64, nextShareURL, nextPwd string) string {
 	b, _ := json.Marshal(FileNote{
 		V: NoteVersion, Kind: "part",
 		ID: groupID, Name: origName, As: uploadName,
-		Index: index, Total: total, Size: size, Next: nextFileID,
+		Index: index, Total: total, Size: size,
+		Next: nextShareURL, NPwd: nextPwd,
 	})
 	return string(b)
 }
@@ -73,7 +77,8 @@ type PartMeta struct {
 	Index   int
 	Total   int
 	Size    int64
-	Next    string // next part file id
+	Next    string // next part share URL
+	NPwd    string // password for next share
 }
 
 // ConvertMeta is parsed from a convert (or raw) note.
@@ -86,9 +91,9 @@ type ConvertMeta struct {
 	Raw    bool // true when kind=raw
 }
 
-// ParseFileNote parses a v1 JSON note only (after HTML unescape).
+// ParseFileNote parses a v1 JSON note only (after HTML cleanup).
 func ParseFileNote(desc string) (FileNote, bool) {
-	desc = htmlUnescape(strings.TrimSpace(desc))
+	desc = cleanShareDesc(strings.TrimSpace(desc))
 	if desc == "" {
 		return FileNote{}, false
 	}
@@ -130,6 +135,34 @@ func htmlUnescape(s string) string {
 	return s
 }
 
+// cleanShareDesc strips autolink <span> etc. injected into share-page descriptions,
+// then HTML-unescapes. Needed because Lanzou wraps https://… with colored spans,
+// which otherwise splits entity sequences like &quot; and breaks JSON.
+func cleanShareDesc(s string) string {
+	if s == "" {
+		return s
+	}
+	// remove tags
+	var b strings.Builder
+	b.Grow(len(s))
+	inTag := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '<' {
+			inTag = true
+			continue
+		}
+		if inTag {
+			if c == '>' {
+				inTag = false
+			}
+			continue
+		}
+		b.WriteByte(c)
+	}
+	return htmlUnescape(strings.TrimSpace(b.String()))
+}
+
 // ParsePartNote extracts PartMeta from a JSON part note.
 func ParsePartNote(desc string) (PartMeta, bool) {
 	n, ok := ParseFileNote(desc)
@@ -141,7 +174,8 @@ func ParsePartNote(desc string) (PartMeta, bool) {
 	}
 	return PartMeta{
 		GroupID: n.ID, Name: n.Name, As: n.As,
-		Index: n.Index, Total: n.Total, Size: n.Size, Next: n.Next,
+		Index: n.Index, Total: n.Total, Size: n.Size,
+		Next: n.Next, NPwd: n.NPwd,
 	}, true
 }
 
@@ -196,6 +230,9 @@ func FormatNoteDebug(desc string) string {
 		s := fmt.Sprintf("part name=%s %d/%d id=%s", n.Name, n.Index, n.Total, n.ID)
 		if n.Next != "" {
 			s += " next=" + n.Next
+			if n.NPwd != "" {
+				s += " npwd=" + n.NPwd
+			}
 		}
 		return s
 	default:

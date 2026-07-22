@@ -186,7 +186,8 @@ func runParse(args []string) {
 	outDir := fs.StringP("output-dir", "o", ".", "download directory")
 	filename := fs.StringP("filename", "f", "", "save filename")
 	noResolve := fs.Bool("no-resolve", false, "skip CDN direct resolve")
-	_, _, cookie := accountFlags(fs)
+	user, pass, cookie := accountFlags(fs)
+	_, _, _ = user, pass, cookie
 	_ = fs.Parse(args)
 
 	if fs.NArg() < 1 {
@@ -240,24 +241,10 @@ func runParse(args []string) {
 		return
 	}
 
-	var acc *lanzou.Account
-	if res.NoteKind == "part" {
-		// Best-effort: use saved cookie to walk next part ids.
-		if st, err := os.Stat(*cookie); err == nil && st.Size() > 0 {
-			func() {
-				defer func() { _ = recover() }()
-				acc = openAccount("", "", *cookie, false)
-			}()
-		}
-		if acc == nil {
-			fmt.Fprintln(os.Stderr, "[warn] part note needs account cookie to merge remaining parts; try lanzou login first")
-		}
-	}
-	path, err := c.DownloadShareNote(shareURL, lanzou.DownloadShareOptions{
+path, err := c.DownloadShareNote(shareURL, lanzou.DownloadShareOptions{
 		Password: *pwd,
 		DestDir:  *outDir,
 		Filename: *filename,
-		Account:  acc,
 	})
 	if err != nil {
 		// Fallback: plain CDN download for non-note or when note path fails

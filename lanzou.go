@@ -542,7 +542,7 @@ func (c *Client) Parse(shareURL string, opt Options) (*Result, error) {
 		Telecom:           ls.telecom,
 		Unicom:            ls.unicom,
 		Normal:            ls.normal,
-		Description:       htmlUnescape(desc),
+		Description:       cleanShareDesc(desc),
 		Note:              note,
 		OrigName:          origName,
 		NoteKind:          noteKind,

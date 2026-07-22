@@ -16,7 +16,7 @@ type DownloadShareOptions struct {
 	DestDir  string
 	// Filename overrides the final save name. Empty = auto from note/remote.
 	Filename string
-	// Account enables walking part.next file ids for multi-part notes.
+	// Account enables walking part.next share URLs for multi-part notes.
 	Account *Account
 	// SkipNote disables convert/part restoration (plain download).
 	SkipNote bool
@@ -25,7 +25,7 @@ type DownloadShareOptions struct {
 // DownloadShareNote parses a share link, downloads, and applies convert/part notes:
 //   - convert (zip): download then unzip single entry to original name
 //   - convert (rename) / raw: save as original name
-//   - part: download this part and follow next file ids (needs Account), merge to original name
+//   - part: download this part and follow next share URLs (+ npwd), merge to original name
 //
 // Without a note, behaves like DownloadShare.
 func (c *Client) DownloadShareNote(shareURL string, opt DownloadShareOptions) (string, error) {
@@ -124,37 +124,43 @@ func downloadPartChain(res *Result, shareURL string, opt DownloadShareOptions) (
 		size:     res.Note.Size,
 	}}
 
-	if opt.Account != nil && res.Note.Next != "" {
-		nextID := res.Note.Next
-		seen := map[string]struct{}{res.FID: {}}
-		for guard := 0; nextID != "" && guard < 256; guard++ {
-			if _, ok := seen[nextID]; ok {
-				break
-			}
-			seen[nextID] = struct{}{}
-			share, pwd, err := opt.Account.GetFileDownloadInfo(nextID)
+	// Walk next share URLs from notes (no account required).
+	if res.Note.Next != "" {
+		nextURL := normalizeShareURL(res.Note.Next)
+		nextPwd := res.Note.NPwd
+		seen := map[string]struct{}{shareURL: {}}
+		if nextURL != "" {
+			seen[nextURL] = struct{}{}
+		}
+		for guard := 0; nextURL != "" && guard < 256; guard++ {
+			nc := New()
+			nres, err := nc.Parse(nextURL, Options{Password: nextPwd, ResolveDirect: false})
 			if err != nil {
-				return "", fmt.Errorf("part next id=%s info: %w", nextID, err)
+				return "", fmt.Errorf("part next share: %w", err)
 			}
-			desc, _ := opt.Account.GetFileDescribe(nextID)
-			pm, ok := ParsePartNote(desc)
 			idx := len(jobs) + 1
 			var size int64
-			var following string
-			if ok {
-				idx = pm.Index
-				size = pm.Size
-				following = pm.Next
-				if total < pm.Total {
-					total = pm.Total
+			following, followingPwd := "", ""
+			if nres.Note != nil && nres.Note.Kind == "part" {
+				idx = nres.Note.Index
+				size = nres.Note.Size
+				following = nres.Note.Next
+				followingPwd = nres.Note.NPwd
+				if total < nres.Note.Total {
+					total = nres.Note.Total
 				}
 			}
-			jobs = append(jobs, partJob{index: idx, shareURL: share, pwd: pwd, size: size})
-			nextID = following
+			jobs = append(jobs, partJob{index: idx, shareURL: nextURL, pwd: nextPwd, size: size})
+			if following == "" {
+				break
+			}
+			if _, ok := seen[following]; ok {
+				break
+			}
+			seen[following] = struct{}{}
+			nextURL = normalizeShareURL(following)
+			nextPwd = followingPwd
 		}
-	} else if res.Note.Next != "" && opt.Account == nil {
-		fmt.Fprintf(os.Stderr, "[warn] part note next=%s needs login cookie to fetch remaining parts; only this part (%d/%d)\n",
-			res.Note.Next, res.Note.Index, total)
 	}
 
 	for i := 0; i < len(jobs); i++ {
@@ -229,6 +235,24 @@ func downloadPartChain(res *Result, shareURL string, opt DownloadShareOptions) (
 	}
 	fmt.Fprintf(os.Stderr, "[done] merged: %s\n", outPath)
 	return outPath, nil
+}
+
+func normalizeShareURL(u string) string {
+	u = strings.TrimSpace(u)
+	if u == "" {
+		return u
+	}
+	if strings.HasPrefix(u, "//") {
+		return "https:" + u
+	}
+	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+		return u
+	}
+	// host/path without scheme
+	if strings.Contains(u, ".") && strings.Contains(u, "/") {
+		return "https://" + u
+	}
+	return u
 }
 
 func sanitizeFileName(name string) string {

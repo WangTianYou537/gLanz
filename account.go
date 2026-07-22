@@ -965,7 +965,7 @@ func (a *Account) Upload(localPath, folderID string) (*UploadResult, error) {
 }
 
 // uploadSplit splits localPath into chunks, converts each, uploads, writes notes.
-// Notes form a linked list via "next" (file id of the following part).
+// Notes form a linked list via "next" (share URL of the following part) + "npwd".
 func (a *Account) uploadSplit(
 	localPath, origName, folderID string,
 	cfg Config, chunkBytes int64, parentCleanup func(),
@@ -991,7 +991,7 @@ func (a *Account) uploadSplit(
 	}
 	fmt.Fprintf(os.Stderr, "[upload] split ready  parts=%d  group=%s\n", total, groupID)
 
-	// Phase 1: upload all parts (notes written in phase 2 once next ids known).
+	// Phase 1: upload all parts (notes written in phase 2 once next share URLs known).
 	type staged struct {
 		fileID string
 		name   string
@@ -1060,16 +1060,34 @@ func (a *Account) uploadSplit(
 		})
 	}
 
-	// Phase 2: write part notes with next → following file id.
+	// Phase 2: write part notes with next → following share URL (+ npwd).
 	fmt.Fprintf(os.Stderr, "[upload] writing part notes (%d)...\n", total)
+	// Prefetch share links for every part so "next" can point at a public URL.
+	type shareInfo struct {
+		url string
+		pwd string
+	}
+	shares := make([]shareInfo, len(stagedParts))
+	for i, sp := range stagedParts {
+		if sp.fileID == "" {
+			continue
+		}
+		u, p, err := a.GetFileDownloadInfo(sp.fileID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[warn] part %d share info: %v\n", sp.index, err)
+			continue
+		}
+		shares[i] = shareInfo{url: u, pwd: p}
+	}
 	parts := make([]UploadPart, 0, total)
 	for i, sp := range stagedParts {
-		nextID := ""
+		nextURL, nextPwd := "", ""
 		if i+1 < len(stagedParts) {
-			nextID = stagedParts[i+1].fileID
+			nextURL = shares[i+1].url
+			nextPwd = shares[i+1].pwd
 		}
 		if sp.fileID != "" {
-			note := FormatPartNote(groupID, origName, sp.name, sp.index, total, sp.size, nextID)
+			note := FormatPartNote(groupID, origName, sp.name, sp.index, total, sp.size, nextURL, nextPwd)
 			if _, nerr := a.SetFileDescribe(sp.fileID, note); nerr != nil {
 				fmt.Fprintf(os.Stderr, "[warn] set part note %d: %v\n", sp.index, nerr)
 			}
